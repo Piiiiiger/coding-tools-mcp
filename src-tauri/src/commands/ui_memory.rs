@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use tauri::command;
 use tauri::webview::WebviewWindowBuilder;
-use tauri::{AppHandle, Manager, WebviewUrl};
+use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
 
 use crate::error::{AppError, AppResult};
 
@@ -46,6 +46,15 @@ pub struct WebviewMemorySample {
 
 fn bytes_to_mb(bytes: u64) -> f64 {
     (bytes as f64) / (1024.0 * 1024.0)
+}
+
+/// Windows returns sentinel coords (often around -32000) for minimized windows.
+fn is_sane_position(pos: &PhysicalPosition<i32>) -> bool {
+    pos.x > -10_000 && pos.y > -10_000 && pos.x < 50_000 && pos.y < 50_000
+}
+
+fn is_sane_size(size: &PhysicalSize<u32>) -> bool {
+    size.width >= 200 && size.height >= 200 && size.width < 20_000 && size.height < 20_000
 }
 
 /// Sample UI-related memory. Does not touch MCP/Actions/FRP runtimes.
@@ -100,16 +109,21 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("no webview window to recreate".into()))?;
 
     let label = window.label().to_string();
-    let outer_position = window.outer_position().ok();
-    let outer_size = window.outer_size().ok();
+    let was_minimized = window.is_minimized().unwrap_or(false);
     let is_maximized = window.is_maximized().unwrap_or(false);
-    // Do NOT re-apply minimized after rebuild: recreating a minimized WebViewWindow
-    // on Windows often leaves a taskbar entry that cannot be restored/maximized
-    // (silent recreate while minimized made the UI unreachable).
 
-    // Unminimize first so destroy/rebuild happens from a normal window state.
+    // Unminimize BEFORE reading geometry. Minimized windows on Windows often
+    // report outer_position ≈ (-32000, -32000); restoring that parks the new
+    // window off-screen so the taskbar icon appears dead.
     let _ = window.unminimize();
     let _ = window.show();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let outer_position = window
+        .outer_position()
+        .ok()
+        .filter(|pos| is_sane_position(pos));
+    let outer_size = window.outer_size().ok().filter(|size| is_sane_size(size));
 
     // Keepalive window: ensures destroy(main) is not "close last window → exit".
     let keepalive = WebviewWindowBuilder::new(
@@ -151,30 +165,38 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
             .min_inner_size(960.0, 640.0)
             .build()
             .map_err(|err| {
-                // Best effort: leave keepalive so the process still has a window.
                 AppError::Message(format!(
                     "rebuild webview failed ({config_err}); fallback also failed: {err}"
                 ))
             })?,
     };
 
-    if let Some(pos) = outer_position {
-        let _ = new_window.set_position(tauri::Position::Physical(pos));
-    }
     if let Some(size) = outer_size {
         let _ = new_window.set_size(tauri::Size::Physical(size));
     }
+    if let Some(pos) = outer_position {
+        let _ = new_window.set_position(tauri::Position::Physical(pos));
+    } else {
+        let _ = new_window.center();
+    }
 
-    // Always bring the replacement window back as a normal, restorable window.
+    // Establish a normal on-screen window first so later minimize (if any) is restorable.
     let _ = new_window.unminimize();
     let _ = new_window.show();
-    if is_maximized {
+    if is_maximized && !was_minimized {
         let _ = new_window.maximize();
     }
     let _ = new_window.set_focus();
 
-    // Remove keepalive only after main is back.
+    // Remove keepalive only after main is back and interactive.
     let _ = keepalive.destroy();
+
+    // If the user had it minimized (silent memory refresh), put it back in the
+    // taskbar — but only after geometry is sane, so restore from taskbar works.
+    if was_minimized {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = new_window.minimize();
+    }
 
     Ok(())
 }

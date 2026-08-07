@@ -1,6 +1,7 @@
 use tauri::State;
 
 use crate::app_state::AppState;
+use crate::commands::runtime::{listener_public_url_changed, reload_listener_after_tunnel_change};
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::tunnel::{
@@ -193,7 +194,11 @@ pub async fn restart_tunnel(
         }
     };
 
+    let public_url_changed = listener_public_url_changed(&profile, kind, &status.public_url);
     persist_public_url(&state, &id, kind, &status.public_url)?;
+    if public_url_changed {
+        reload_listener_after_tunnel_change(&state, &id, kind).await?;
+    }
     Ok(status)
 }
 
@@ -214,7 +219,11 @@ pub async fn start_tunnel(
         guard.start(&profile, kind, &settings).await?
     };
 
+    let public_url_changed = listener_public_url_changed(&profile, kind, &status.public_url);
     persist_public_url(&state, &id, kind, &status.public_url)?;
+    if public_url_changed {
+        reload_listener_after_tunnel_change(&state, &id, kind).await?;
+    }
     Ok(status)
 }
 
@@ -314,7 +323,11 @@ pub async fn test_tunnel(
     let keep_tunnel = runtime_running;
 
     if keep_tunnel {
+        let public_url_changed = listener_public_url_changed(&profile, kind, &public_url);
         persist_public_url(&state, &id, kind, &public_url)?;
+        if public_url_changed {
+            reload_listener_after_tunnel_change(&state, &id, kind).await?;
+        }
         return Ok(TunnelTestResult {
             success: !public_url.is_empty() || status.state == "running",
             public_url,

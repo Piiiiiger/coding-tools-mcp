@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -196,6 +197,25 @@ pub fn extract_trycloudflare_url(line: &str) -> Option<String> {
     None
 }
 
+fn prepare_quick_tunnel_config(log_path: &Path) -> AppResult<PathBuf> {
+    let config_path = log_path.with_extension("quick.yml");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_path, "{}\n")?;
+    Ok(config_path)
+}
+
+fn quick_tunnel_args(port: u16, config_path: &Path) -> Vec<OsString> {
+    vec![
+        "tunnel".into(),
+        "--config".into(),
+        config_path.as_os_str().to_owned(),
+        "--url".into(),
+        format!("http://127.0.0.1:{port}").into(),
+    ]
+}
+
 /// Apply the global proxy to a tunnel child process environment.
 pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
     let url = match proxy.mode.as_str() {
@@ -272,11 +292,8 @@ pub async fn spawn_cloudflare_tunnel(
     }
 
     if quick {
-        cmd.args([
-            "tunnel",
-            "--url",
-            &format!("http://127.0.0.1:{port}"),
-        ]);
+        let config_path = prepare_quick_tunnel_config(log_path)?;
+        cmd.args(quick_tunnel_args(port, &config_path));
     } else {
         cmd.args([
             "tunnel",
@@ -462,7 +479,9 @@ pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_trycloudflare_url;
+    use std::ffi::OsString;
+
+    use super::{extract_trycloudflare_url, prepare_quick_tunnel_config, quick_tunnel_args};
 
     #[test]
     fn extracts_trycloudflare_url_from_log_line() {
@@ -477,5 +496,31 @@ mod tests {
     fn ignores_invalid_hosts() {
         let line = "https://bad_host.trycloudflare.com";
         assert!(extract_trycloudflare_url(line).is_none());
+    }
+
+    #[test]
+    fn quick_tunnel_uses_an_app_owned_empty_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("cloudflared.log");
+
+        let config_path = prepare_quick_tunnel_config(&log_path).unwrap();
+        let args = quick_tunnel_args(28_766, &config_path);
+
+        assert_eq!(config_path, temp.path().join("cloudflared.quick.yml"));
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "{}\n");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("tunnel"),
+                OsString::from("--config"),
+                config_path.as_os_str().to_owned(),
+                OsString::from("--url"),
+                OsString::from("http://127.0.0.1:28766"),
+            ]
+        );
+
+        std::fs::write(&config_path, "ingress:\n  - service: http_status:404\n").unwrap();
+        prepare_quick_tunnel_config(&log_path).unwrap();
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), "{}\n");
     }
 }

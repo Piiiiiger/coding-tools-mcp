@@ -69,6 +69,70 @@ async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {
     sync_managed_runtime_routes(active_keys).await
 }
 
+fn public_base_url(
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> String {
+    match kind {
+        TunnelServiceKind::Mcp => profile.effective_public_url(),
+        TunnelServiceKind::Actions => profile.actions_public_base_url(),
+    }
+}
+
+pub(crate) fn listener_public_url_changed(
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+    public_url: &str,
+) -> bool {
+    let next = public_url.trim().trim_end_matches('/');
+    !next.is_empty() && public_base_url(profile, kind).trim().trim_end_matches('/') != next
+}
+
+async fn reload_running_listener(
+    state: &AppState,
+    id: &str,
+    kind: TunnelServiceKind,
+) -> AppResult<()> {
+    let service_kind = match kind {
+        TunnelServiceKind::Mcp => ServiceKind::Mcp,
+        TunnelServiceKind::Actions => ServiceKind::Actions,
+    };
+    let is_running = state.with_runtime(|runtime| Ok(runtime.is_running(id, service_kind)))?;
+    if !is_running {
+        return Ok(());
+    }
+
+    let profile = profile_by_id(state, id)?;
+    let port = match kind {
+        TunnelServiceKind::Mcp => profile.runtime.local_port,
+        TunnelServiceKind::Actions => profile.actions.local_port,
+    };
+    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, service_kind)))?;
+    await_listener_shutdown(handle, port).await;
+    state.with_runtime(|runtime| {
+        runtime.finish_stop(id, service_kind);
+        match kind {
+            TunnelServiceKind::Mcp => {
+                runtime.start_mcp(&profile)?;
+            }
+            TunnelServiceKind::Actions => {
+                runtime.start_actions(&profile)?;
+            }
+        }
+        Ok(())
+    })?;
+    sync_tunnel_routes_from_runtime(state).await
+}
+
+pub(crate) async fn reload_listener_after_tunnel_change(
+    state: &AppState,
+    id: &str,
+    kind: TunnelServiceKind,
+) -> AppResult<()> {
+    let _guard = RESTART_GATE.lock().await;
+    reload_running_listener(state, id, kind).await
+}
+
 #[allow(clippy::collapsible_if)]
 async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> {
     let Some(pid) = platform().find_pid_listening_on_port(port)? else {
@@ -117,14 +181,20 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
     state.with_runtime(|runtime| runtime.start_mcp(&profile))?;
     sync_tunnel_routes_from_runtime(state).await?;
 
-    match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
+    let public_url_changed = match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
         Ok(Some(url)) => {
+            let changed = listener_public_url_changed(&profile, TunnelServiceKind::Mcp, &url);
             persist_tunnel_url(state, id, TunnelServiceKind::Mcp, &url)?;
+            changed
         }
-        Ok(None) => {}
+        Ok(None) => false,
         Err(error) => {
             eprintln!("mcp tunnel auto-start failed for {id}: {error}");
+            false
         }
+    };
+    if public_url_changed {
+        reload_running_listener(state, id, TunnelServiceKind::Mcp).await?;
     }
 
     let profile = profile_by_id(state, id)?;
@@ -156,14 +226,22 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
     state.with_runtime(|runtime| runtime.start_actions(&profile))?;
     sync_tunnel_routes_from_runtime(state).await?;
 
-    match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions).await {
+    let public_url_changed = match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions)
+        .await
+    {
         Ok(Some(url)) => {
+            let changed = listener_public_url_changed(&profile, TunnelServiceKind::Actions, &url);
             persist_tunnel_url(state, id, TunnelServiceKind::Actions, &url)?;
+            changed
         }
-        Ok(None) => {}
+        Ok(None) => false,
         Err(error) => {
             eprintln!("actions tunnel auto-start failed for {id}: {error}");
+            false
         }
+    };
+    if public_url_changed {
+        reload_running_listener(state, id, TunnelServiceKind::Actions).await?;
     }
 
     let profile = profile_by_id(state, id)?;
@@ -175,14 +253,9 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
 }
 
 /// Async stop→start for MCP. Used by the Tauri command and secret-change hooks.
-pub(crate) async fn restart_mcp_by_id(
-    state: &AppState,
-    id: &str,
-) -> AppResult<RuntimeStatusDto> {
+pub(crate) async fn restart_mcp_by_id(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     let _guard = RESTART_GATE.lock().await;
-    let was_running = state.with_runtime(|runtime| {
-        Ok(runtime.is_running(id, ServiceKind::Mcp))
-    })?;
+    let was_running = state.with_runtime(|runtime| Ok(runtime.is_running(id, ServiceKind::Mcp)))?;
     if was_running {
         let _ = stop_mcp_service(state, id).await?;
     }
@@ -195,9 +268,8 @@ pub(crate) async fn restart_actions_by_id(
     id: &str,
 ) -> AppResult<RuntimeStatusDto> {
     let _guard = RESTART_GATE.lock().await;
-    let was_running = state.with_runtime(|runtime| {
-        Ok(runtime.is_running(id, ServiceKind::Actions))
-    })?;
+    let was_running =
+        state.with_runtime(|runtime| Ok(runtime.is_running(id, ServiceKind::Actions)))?;
     if was_running {
         let _ = stop_actions_service(state, id).await?;
     }
@@ -265,4 +337,47 @@ pub async fn restart_actions_runtime(
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     restart_actions_by_id(&state, &id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listener_public_url_changed;
+    use crate::tunnel::TunnelServiceKind;
+    use crate::workspace::WorkspaceProfile;
+
+    #[test]
+    fn detects_mcp_quick_tunnel_url_changes() {
+        let mut profile = WorkspaceProfile::new("/tmp/workspace".into(), Some("test".into()));
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.public_url = "https://old.trycloudflare.com".into();
+
+        assert!(listener_public_url_changed(
+            &profile,
+            TunnelServiceKind::Mcp,
+            "https://new.trycloudflare.com"
+        ));
+        assert!(!listener_public_url_changed(
+            &profile,
+            TunnelServiceKind::Mcp,
+            "https://old.trycloudflare.com/"
+        ));
+    }
+
+    #[test]
+    fn detects_actions_url_changes_and_ignores_empty_urls() {
+        let mut profile = WorkspaceProfile::new("/tmp/workspace".into(), Some("test".into()));
+        profile.actions.tunnel_type = "cloudflare".into();
+        profile.actions.public_url = "https://old.trycloudflare.com".into();
+
+        assert!(listener_public_url_changed(
+            &profile,
+            TunnelServiceKind::Actions,
+            "https://new.trycloudflare.com"
+        ));
+        assert!(!listener_public_url_changed(
+            &profile,
+            TunnelServiceKind::Actions,
+            ""
+        ));
+    }
 }

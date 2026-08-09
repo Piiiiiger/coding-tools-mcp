@@ -255,4 +255,3 @@ pub fn get_last_workspace_id(state: State<'_, AppState>) -> AppResult<String> {
     state.with_settings(|store| Ok(store.settings().last_workspace_id))
 
 }
-

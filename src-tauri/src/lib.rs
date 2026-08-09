@@ -5,6 +5,7 @@ mod app_state;
 mod auth;
 mod commands;
 mod data;
+mod desktop_lifecycle;
 mod error;
 pub mod harness;
 mod health;
@@ -22,14 +23,14 @@ use app_state::AppState;
 use commands::{
     check_app_update, create_workspace, delete_frp_profile, delete_workspace,
     get_actions_runtime_status, get_app_settings, get_download_config, get_frp_snippet,
-    get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret, get_webview_memory_sample,
-    get_workspace_secret, install_software, list_frp_profiles, list_software, list_workspaces,
-    open_url, open_workspace_directory, read_workspace_logs, recreate_ui_webview,
-    regenerate_shared_secret, regenerate_workspace_secret, restart_actions_runtime, restart_runtime,
-    restart_tunnel, run_health_checks, save_frp_profile, set_download_config, set_last_workspace,
-    set_proxy, set_shared_secret, set_workspace_secret, start_actions_runtime, start_runtime,
-    start_tunnel, stop_actions_runtime, stop_runtime, stop_tunnel, test_tunnel, uninstall_software,
-    update_workspace,
+    get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret,
+    get_webview_memory_sample, get_workspace_secret, install_software, list_frp_profiles,
+    list_software, list_workspaces, open_url, open_workspace_directory, read_workspace_logs,
+    recreate_ui_webview, regenerate_shared_secret, regenerate_workspace_secret,
+    restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
+    set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
+    start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
+    stop_tunnel, test_tunnel, uninstall_software, update_workspace,
 };
 use tauri::Manager;
 
@@ -72,6 +73,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(AppState::new().expect("failed to load app state"));
+            if let Err(error) = desktop_lifecycle::install_tray(app) {
+                eprintln!("system tray is unavailable; close-to-tray disabled: {error}");
+            }
             // Recover FRP clients that stay alive while the public proxy dies
             // (common after install/restart network blips).
             tunnel::ensure_frp_health_loop();
@@ -122,6 +126,7 @@ pub fn run() {
             get_webview_memory_sample,
             recreate_ui_webview,
         ])
+        .on_window_event(desktop_lifecycle::handle_window_event)
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
@@ -129,7 +134,9 @@ pub fn run() {
             // window; without prevent_exit Tauri would quit the whole process
             // and take MCP/FRP down with it (0.1.30 regression).
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if commands::ui_memory::should_prevent_exit() {
+                if desktop_lifecycle::should_prevent_app_exit(
+                    commands::ui_memory::should_prevent_exit(),
+                ) {
                     api.prevent_exit();
                 }
             }

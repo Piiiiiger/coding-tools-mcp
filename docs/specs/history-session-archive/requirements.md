@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-为 ChatGPT 网页版新增跨会话开发状态归档能力。每个新聊天首次使用插件时，ChatGPT 先调用 `history_session_bootstrap`；服务端依据工具调用元数据 `_meta["openai/session"]` 识别当前聊天。没有历史时创建首个会话文件，已有历史时读取 `docs/history-session/` 并返回累计摘要、逐会话摘要和最新完整 handoff。功能支持 Windows、macOS 和 Linux，复用现有 Streamable HTTP `/mcp` 与隧道，不引入 OpenAI SDK，不改变任何现有工具的输入、输出或业务语义。
+为 ChatGPT 网页版新增跨会话开发状态归档能力。每个新聊天首次使用插件时，ChatGPT 先调用 `history_session_bootstrap`；服务端依据工具调用元数据 `_meta["openai/session"]` 识别当前聊天。没有历史时创建首个会话文件；已有历史时扫描 `docs/history-session/` 做完整性与摘要计算，但只把有界 `project_state` 与最近 `latest_delta` 注入启动结果，旧 handoff 按需读取而不自动展开。功能支持 Windows、macOS 和 Linux，复用现有 Streamable HTTP `/mcp` 与隧道，不引入 OpenAI SDK。
 
 ## 历史经验与坑（来自记忆库）
 
@@ -43,18 +43,19 @@
 4. WHEN `_meta["openai/session"]` 与显式 `session_key` 同时存在 THEN 系统 SHALL 使用宿主元数据并返回来源 `platform_conversation_id`。
 5. IF 两种会话标识均不存在 THEN 系统 SHALL 返回 `SESSION_ID_UNAVAILABLE`，不得生成不可复用的临时 ID。
 
-### FR-2: 全历史摘要和最新 handoff
+### FR-2: 有界滚动状态与按需历史
 
 **优先级:** Must
-**用户故事:** 作为恢复会话的开发者，我想获得所有阶段摘要和最近一次完整交接，以便保留早期决定并重点恢复最新状态。
+**用户故事:** 作为恢复会话的开发者，我希望自动获得足够继续工作的有界上下文，同时保留完整历史可按需读取，以免项目越久新对话越容易耗尽上下文。
 
 #### 验收标准（EARS）
 
-1. WHEN bootstrap 成功 THEN 系统 SHALL 按数字升序解析全部历史文件并返回 `session_summaries`。
-2. WHEN bootstrap 成功 THEN 系统 SHALL 返回跨全部既有会话合并的 `all_history_summary`。
-3. WHEN存在当前会话之前的历史 THEN 系统 SHALL 在 `latest_handoff` 返回最大既有编号文件的完整 UTF-8 内容。
-4. WHEN 历史总量超过完整注入阈值 THEN 系统 SHALL 返回摘要加最新全文，并将 `full_history_included` 设为 `false`。
-5. WHEN 返回历史 THEN 系统 SHALL 同时返回读取模式、总字节数和 SHA-256 摘要。
+1. WHEN bootstrap 成功且 `docs/history-state/PROJECT_STATE.md` 存在 THEN 系统 SHALL 在 `project_state` 返回最多 8 KiB 的 UTF-8 滚动状态，并在截断时设置 `project_state_truncated=true`。
+2. WHEN 存在当前会话之前的历史 THEN 系统 SHALL 对最大既有编号 handoff 生成最多 4 KiB 的 `latest_delta`；系统 SHALL NOT 在 bootstrap 中返回该 handoff 的完整正文。
+3. WHEN bootstrap 返回历史 THEN 系统 SHALL NOT 同时返回 `session_summaries`、`all_history_summary`、`inherited_summary` 或 `latest_handoff` 等重叠历史正文副本。
+4. WHEN 新建当前 handoff THEN 系统 SHALL 只写当前会话元数据与检查点，SHALL NOT 写入 `## 继承的历史摘要` 或复制任何旧 handoff 正文。
+5. WHEN 返回历史 THEN 系统 SHALL 同时返回读取模式、历史文件总字节数和 SHA-256 摘要，并通过 `latest_completed_path` 保留按需读取入口。
+6. WHEN旧版本 handoff 含有 `## 继承的历史摘要` 且收到新的非重复 checkpoint THEN 系统 SHALL 在重写当前会话文件时去除该继承块，同时不得删除原始编号历史文件。
 
 ### FR-3: 幂等检查点
 
@@ -115,7 +116,7 @@
 
 1. WHEN客户端调用 `tools/list` THEN 系统 SHALL 在现有工具之外返回三个历史工具及完整 JSON Schema。
 2. WHEN调用历史工具 THEN MCP 与 Actions SHALL 继续通过唯一 `call_tool` 入口执行。
-3. WHEN调用任一既有工具 THEN 系统 SHALL 保持原输入、输出、权限和执行路径不变。
+3. WHEN调用任一既有工具 THEN 系统 SHALL 保持原结构化 `structuredContent`、输入、权限和执行路径不变；模型可见 `content` MAY 从完整 JSON 镜像改为等价的人类可读摘要或正文预览。
 4. WHEN构建依赖解析 THEN 系统 SHALL 不包含 OpenAI SDK。
 
 ### FR-8: ChatGPT 持久化工作流提示
@@ -150,7 +151,7 @@
 - **NFR-1（兼容性）**: 支持 Windows 10+、macOS 12+、Linux x86_64；相同测试向量在三平台产生等价 JSON 结果。
 - **NFR-2（安全）**: 所有历史路径限定在当前工作区；不执行 Shell、不删除历史、不自动提交 Git；服务器端不信任模型输入。
 - **NFR-3（一致性）**: 同一进程和跨进程并发 bootstrap 不得分配重复编号；写入失败后原文件保持完整。
-- **NFR-4（性能）**: 100 个、总计不超过 10 MiB 的历史文件 bootstrap 在本地 SSD 上应在 2 秒内完成。
+- **NFR-4（性能/上下文）**: 100 个、总计不超过 10 MiB 的历史文件 bootstrap 在本地 SSD 上应在 2 秒内完成；bootstrap 的结构化结果体积不得随旧 handoff 正文线性增长，`project_state` 与 `latest_delta` 的合计正文预算不超过 12 KiB。
 - **NFR-5（可维护性）**: 历史模块按模型、Markdown、存储和用例拆分，单文件不超过 500 行；新增核心逻辑测试覆盖率不低于 80%。
 
 ---

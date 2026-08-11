@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError, WorkspaceResult};
 
+const PROJECT_STATE_RELATIVE_PATH: &str = "docs/history-state/PROJECT_STATE.md";
+const MAX_PROJECT_STATE_BYTES: usize = 8 * 1024;
+const MAX_LATEST_DELTA_BYTES: usize = 4 * 1024;
+
 pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let (session_key, source) = resolve_session_key(args)?;
     let host_session_key_mismatch = host_session_key(args)
@@ -84,18 +88,14 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("开发会话");
-        let inherited_summary = build_inherited_summary(&report.documents);
-        let content = markdown::attach_inherited_summary(
-            markdown::render_document(
-                number,
-                title,
-                &session_key,
-                &timestamp,
-                &timestamp,
-                "active",
-                &[],
-            ),
-            &inherited_summary,
+        let content = markdown::render_document(
+            number,
+            title,
+            &session_key,
+            &timestamp,
+            &timestamp,
+            "active",
+            &[],
         );
         storage::write_markdown(&history_dir.join(format!("{number}.md")), &content)?;
         (number, relative_path, true, false)
@@ -114,29 +114,27 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .iter()
         .map(|document| document.number)
         .collect::<Vec<_>>();
-    let session_summaries = prior
-        .iter()
+    let latest = prior.iter().max_by_key(|document| document.number).copied();
+    let (project_state, project_state_truncated) = read_project_state(ctx)?;
+    if project_state_truncated {
+        warnings.push(format!(
+            "{PROJECT_STATE_RELATIVE_PATH} 超过启动上下文预算，bootstrap 已返回截断版本；需要细节时按需读取原文件。"
+        ));
+    }
+    let (latest_delta, latest_delta_truncated) = latest
         .map(|document| {
-            json!({
-                "number": document.number,
-                "path": document.path,
-                "summary": markdown::summary(&document.content)
-            })
-        })
-        .collect::<Vec<_>>();
-    let all_history_summary = session_summaries
-        .iter()
-        .map(|summary| {
-            format!(
-                "会话 {}（{}）：{}",
-                summary["number"].as_u64().unwrap_or_default(),
-                summary["path"].as_str().unwrap_or_default(),
-                summary["summary"].as_str().unwrap_or_default()
+            bounded_utf8(
+                &markdown::summary(&document.content),
+                MAX_LATEST_DELTA_BYTES,
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let latest = prior.iter().max_by_key(|document| document.number).copied();
+        .unwrap_or_else(|| (String::new(), false));
+    if latest_delta_truncated {
+        warnings.push(
+            "最新会话摘要超过启动上下文预算，bootstrap 已返回截断版本；需要细节时按需读取 latest_completed_path。"
+                .into(),
+        );
+    }
     let mut digest = Sha256::new();
     let mut total_bytes = 0_u64;
     for document in &prior {
@@ -159,26 +157,19 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "created": created,
         "resumed": resumed,
         "sequence_valid": report.sequence_valid(),
-        "all_history_summary": all_history_summary,
-        "inherited_summary": markdown::inherited_summary(
-            refreshed
-                .documents
-                .iter()
-                .find(|document| document.number == current_number)
-                .map(|document| document.content.as_str())
-                .unwrap_or_default()
-        ),
-        "session_summaries": session_summaries,
-        "latest_handoff": latest.map(|document| document.content.clone()),
-        "history_read_mode": "all_summaries_plus_latest_full",
+        "project_state_path": project_state.as_ref().map(|_| PROJECT_STATE_RELATIVE_PATH),
+        "project_state": project_state.unwrap_or_default(),
+        "project_state_truncated": project_state_truncated,
+        "latest_delta": latest_delta,
+        "latest_delta_truncated": latest_delta_truncated,
+        "history_read_mode": "project_state_plus_latest_delta",
         "total_history_bytes": total_bytes,
         "full_history_included": false,
         "history_digest": format!("{:x}", digest.finalize()),
         "persistence_mode": "model_mediated_tool_calls",
-        "assistant_instructions": "Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.",
+        "assistant_instructions": "Use project_state as the canonical rolling context and latest_delta as the bounded recent handoff. Do not expand older history automatically; when a task needs historical detail, read latest_completed_path or a specific numbered history file on demand. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.",
         "required_next_actions": [
-            "read_all_history_summary",
-            "read_latest_handoff",
+            "use_project_state_and_latest_delta",
             "verify_workspace_state",
             "execute_user_task",
             "checkpoint_after_each_completed_task"
@@ -281,18 +272,14 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             .created_at
             .clone()
             .unwrap_or_else(|| timestamp.clone());
-        let inherited_summary = markdown::inherited_summary(&document.content);
-        markdown::attach_inherited_summary(
-            markdown::render_document(
-                document.number,
-                &markdown::document_title(&document.content, document.number),
-                &session_key,
-                &created_at,
-                &record.timestamp,
-                "active",
-                &records,
-            ),
-            inherited_summary.as_deref().unwrap_or_default(),
+        markdown::render_document(
+            document.number,
+            &markdown::document_title(&document.content, document.number),
+            &session_key,
+            &created_at,
+            &record.timestamp,
+            "active",
+            &records,
         )
     };
     if !duplicate_ignored {
@@ -460,42 +447,34 @@ fn now_timestamp() -> String {
     format!("unix:{seconds}")
 }
 
-fn build_inherited_summary(documents: &[model::HistoryDocument]) -> String {
-    const MAX_TOTAL_CHARS: usize = 16_000;
-    const MAX_SESSION_CHARS: usize = 3_000;
-
-    let mut entries = Vec::new();
-    let mut used = 0_usize;
-    let mut omitted = 0_usize;
-    for document in documents.iter().rev() {
-        let compact = truncate_chars(&markdown::summary(&document.content), MAX_SESSION_CHARS);
-        let entry = format!(
-            "### 会话 {}（{}）\n\n{}",
-            document.number, document.path, compact
-        );
-        let entry_len = entry.chars().count();
-        if used + entry_len > MAX_TOTAL_CHARS {
-            omitted += 1;
-            continue;
-        }
-        used += entry_len;
-        entries.push(entry);
+fn read_project_state(ctx: &ToolContext) -> WorkspaceResult<(Option<String>, bool)> {
+    let path = ctx.workspace.root().join(PROJECT_STATE_RELATIVE_PATH);
+    if !path.is_file() {
+        return Ok((None, false));
     }
-    entries.reverse();
-    if omitted > 0 {
-        entries.insert(
-            0,
-            format!("> 另有 {omitted} 个较早会话未展开，可通过 all_history_summary 读取。"),
-        );
-    }
-    entries.join("\n\n")
+    let content = fs::read_to_string(&path).map_err(|error| {
+        history_error(
+            "HISTORY_READ_FAILED",
+            &error.to_string(),
+            "filesystem",
+            true,
+            json!({"path": PROJECT_STATE_RELATIVE_PATH}),
+        )
+    })?;
+    let (bounded, truncated) = bounded_utf8(&content, MAX_PROJECT_STATE_BYTES);
+    Ok((Some(bounded), truncated))
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+fn bounded_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
     }
-    let mut truncated = value.chars().take(max_chars).collect::<String>();
-    truncated.push_str("…（摘要已截断）");
-    truncated
+    const SUFFIX: &str = "\n…（启动上下文已截断）";
+    let mut end = max_bytes.saturating_sub(SUFFIX.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = value[..end].to_string();
+    truncated.push_str(SUFFIX);
+    (truncated, true)
 }

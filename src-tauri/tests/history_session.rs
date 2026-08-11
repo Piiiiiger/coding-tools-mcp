@@ -80,7 +80,7 @@ fn checkpoint_rejects_a_path_from_another_session() {
 }
 
 #[test]
-fn inherited_summary_is_preserved_without_recursive_growth() {
+fn checkpoint_removes_legacy_inherited_summary_and_new_sessions_do_not_copy_history() {
     let (workspace, _harness, ctx) = test_context();
     prepare_history(workspace.path());
     let boot = invoke(
@@ -89,6 +89,19 @@ fn inherited_summary_is_preserved_without_recursive_growth() {
         json!({"session_key": "summary-session"}),
     );
     let boot = assert_ok(&boot);
+    let current_path = workspace.path().join("docs/history-session/3.md");
+    let current = fs::read_to_string(&current_path).expect("read current handoff");
+    assert!(!current.contains("## 继承的历史摘要"));
+    assert!(!current.contains("目标-第一阶段"));
+
+    // Simulate a handoff written by the old implementation. The next real
+    // checkpoint must normalize it back to a current-session-only document.
+    let legacy = current.replacen(
+        "**Status:** active\n\n",
+        "**Status:** active\n\n## 继承的历史摘要\n\nLEGACY_INHERITED_MARKER\n\n",
+        1,
+    );
+    fs::write(&current_path, legacy).expect("write legacy inherited block");
     assert_ok(&invoke(
         &ctx,
         "history_session_checkpoint",
@@ -99,10 +112,10 @@ fn inherited_summary_is_preserved_without_recursive_growth() {
             "user_intent": "继续实现"
         }),
     ));
-    let content = fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
-        .expect("read preserved inherited summary");
-    assert_eq!(content.matches("## 继承的历史摘要").count(), 1);
-    assert!(content.contains("目标-第一阶段"));
+    let content = fs::read_to_string(&current_path).expect("read normalized handoff");
+    assert!(!content.contains("## 继承的历史摘要"));
+    assert!(!content.contains("LEGACY_INHERITED_MARKER"));
+    assert!(!content.contains("目标-第一阶段"));
     assert!(content.contains("继续实现"));
 
     let next = invoke(
@@ -112,33 +125,52 @@ fn inherited_summary_is_preserved_without_recursive_growth() {
     );
     assert_ok(&next);
     let next_content = fs::read_to_string(workspace.path().join("docs/history-session/4.md"))
-        .expect("read next inherited summary");
-    assert_eq!(next_content.matches("## 继承的历史摘要").count(), 1);
-    assert!(next_content.contains("### 会话 3（docs/history-session/3.md）"));
+        .expect("read next handoff");
+    assert!(!next_content.contains("## 继承的历史摘要"));
+    assert!(!next_content.contains("继续实现"));
 }
 
 #[test]
-fn inherited_summary_is_bounded_and_reports_omitted_sessions() {
+fn bootstrap_payload_is_bounded_even_when_archived_history_is_large() {
     let (workspace, _harness, ctx) = test_context();
     let dir = workspace.path().join("docs/history-session");
     fs::create_dir_all(&dir).expect("create history dir");
-    let large_marker = "X".repeat(4_000);
-    for number in 1..=12 {
+    let large_marker = "X".repeat(50_000);
+    for number in 1..=20 {
         fs::write(
             dir.join(format!("{number}.md")),
             history_file(number, &format!("session-{number}"), &large_marker),
         )
         .expect("write large history");
     }
+    let state_dir = workspace.path().join("docs/history-state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::write(
+        state_dir.join("PROJECT_STATE.md"),
+        format!("# Canonical state\n{}", "S".repeat(50_000)),
+    )
+    .expect("write large project state");
     let boot = invoke(
         &ctx,
         "history_session_bootstrap",
         json!({"session_key": "bounded-summary"}),
     );
-    assert_ok(&boot);
-    let content = fs::read_to_string(dir.join("13.md")).expect("read bounded summary");
-    assert!(content.contains("个较早会话未展开"));
-    assert!(content.chars().count() < 20_000);
+    let boot = assert_ok(&boot);
+    assert!(boot["total_history_bytes"].as_u64().unwrap_or(0) > 1_000_000);
+    assert!(boot["project_state"].as_str().unwrap_or("").len() <= 8 * 1024);
+    assert!(boot["latest_delta"].as_str().unwrap_or("").len() <= 4 * 1024);
+    assert_eq!(boot["project_state_truncated"], true);
+    assert_eq!(boot["latest_delta_truncated"], true);
+    assert!(boot.get("all_history_summary").is_none());
+    assert!(boot.get("inherited_summary").is_none());
+    assert!(boot.get("session_summaries").is_none());
+    assert!(boot.get("latest_handoff").is_none());
+    assert!(serde_json::to_vec(boot).expect("serialize bootstrap").len() < 20 * 1024);
+
+    let content = fs::read_to_string(dir.join("21.md")).expect("read bounded handoff");
+    assert!(content.len() < 1_000);
+    assert!(!content.contains("## 继承的历史摘要"));
+    assert!(!content.contains(&large_marker[..256]));
 }
 
 fn history_file(number: u64, session_key: &str, marker: &str) -> String {
@@ -265,9 +297,16 @@ fn workspace_root_accepts_dot_and_current_absolute_path_but_rejects_outside() {
 }
 
 #[test]
-fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
+fn bootstrap_creates_next_file_returns_compact_state_and_is_idempotent() {
     let (workspace, _harness, ctx) = test_context();
     prepare_history(workspace.path());
+    let state_dir = workspace.path().join("docs/history-state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::write(
+        state_dir.join("PROJECT_STATE.md"),
+        "# Project state\nCANONICAL_ROLLING_STATE\n",
+    )
+    .expect("write project state");
 
     let first = invoke(
         &ctx,
@@ -287,10 +326,27 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(first["created"], true);
     assert_eq!(first["resumed"], false);
     assert_eq!(first["sequence_valid"], true);
-    assert_eq!(first["history_read_mode"], "all_summaries_plus_latest_full");
+    assert_eq!(
+        first["history_read_mode"],
+        "project_state_plus_latest_delta"
+    );
     assert_eq!(first["full_history_included"], false);
     assert!(first["total_history_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(first["history_digest"].as_str().unwrap_or("").len(), 64);
+    assert_eq!(
+        first["project_state_path"],
+        "docs/history-state/PROJECT_STATE.md"
+    );
+    assert!(first["project_state"]
+        .as_str()
+        .unwrap_or("")
+        .contains("CANONICAL_ROLLING_STATE"));
+    assert!(first["latest_delta"]
+        .as_str()
+        .unwrap_or("")
+        .contains("第二阶段"));
+    assert_eq!(first["project_state_truncated"], false);
+    assert_eq!(first["latest_delta_truncated"], false);
     assert_eq!(first["persistence_mode"], "model_mediated_tool_calls");
     assert!(first["assistant_instructions"]
         .as_str()
@@ -325,38 +381,22 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(
         first["required_next_actions"],
         json!([
-            "read_all_history_summary",
-            "read_latest_handoff",
+            "use_project_state_and_latest_delta",
             "verify_workspace_state",
             "execute_user_task",
             "checkpoint_after_each_completed_task"
         ])
     );
-    assert_eq!(first["session_summaries"].as_array().unwrap().len(), 2);
-    assert_eq!(first["session_summaries"][0]["number"], 1);
-    assert_eq!(first["session_summaries"][1]["number"], 2);
-    assert!(first["session_summaries"][0]["summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("目标-第一阶段"));
-    assert!(first["all_history_summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("决定-第一阶段"));
-    assert_eq!(
-        first["latest_handoff"],
-        history_file(2, "old-session-2", "第二阶段")
-    );
+    assert!(first.get("session_summaries").is_none());
+    assert!(first.get("all_history_summary").is_none());
+    assert!(first.get("inherited_summary").is_none());
+    assert!(first.get("latest_handoff").is_none());
     assert!(workspace.path().join("docs/history-session/3.md").is_file());
-    let inherited = fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
-        .expect("read inherited summary");
-    assert!(inherited.contains("## 继承的历史摘要"));
-    assert!(inherited.contains("### 会话 1（docs/history-session/1.md）"));
-    assert!(inherited.contains("### 会话 2（docs/history-session/2.md）"));
-    assert!(first["inherited_summary"]
-        .as_str()
-        .unwrap_or("")
-        .contains("目标-第一阶段"));
+    let current = fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
+        .expect("read current handoff");
+    assert!(!current.contains("## 继承的历史摘要"));
+    assert!(!current.contains("第一阶段"));
+    assert!(!current.contains("第二阶段"));
 
     let second = invoke(
         &ctx,

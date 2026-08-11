@@ -28,7 +28,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "history_session_bootstrap",
         "Initialize or restore development session",
-        "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
+        "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns bounded canonical project state plus the latest compact delta and resumes the current ChatGPT session without duplicates. Older handoffs stay on disk for on-demand reads instead of being injected automatically.",
         false,
         false,
         false,

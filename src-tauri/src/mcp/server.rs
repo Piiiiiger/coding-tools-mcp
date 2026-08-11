@@ -51,7 +51,7 @@ fn initialize_result() -> Value {
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, use the bounded project_state and latest_delta returned by bootstrap. Do not automatically expand older history; read a specific numbered handoff only when the user's task requires historical detail. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
     })
 }
 
@@ -134,6 +134,11 @@ mod tests {
         assert!(instructions.contains("before answering the user's first request"));
         assert!(instructions.contains("even if the user did not explicitly ask"));
         assert!(instructions.contains("required conversation initialization"));
+        assert!(instructions.contains("project_state and latest_delta"));
+        assert!(instructions.contains("Do not automatically expand older history"));
+        assert!(!instructions.contains("all_history_summary"));
+        assert!(!instructions.contains("latest_handoff"));
+        assert!(!instructions.contains("inherited_summary"));
         assert!(instructions.contains("must not create duplicates"));
         assert!(instructions.contains("history_session_checkpoint"));
         assert!(instructions.contains("session_key and current_path returned by bootstrap"));
@@ -158,7 +163,10 @@ mod tests {
         assert!(component.contains("ChatGPT 新会话启动提示词"));
         assert!(component.contains("请初始化或恢复当前项目会话"));
         assert!(component.contains("如果没有历史记录"));
-        assert!(component.contains("all_history_summary"));
+        assert!(component.contains("project_state"));
+        assert!(component.contains("latest_delta"));
+        assert!(!component.contains("all_history_summary"));
+        assert!(!component.contains("latest_handoff"));
         assert!(component.contains("history_session_checkpoint"));
         assert!(!component.contains("打开连接器设置"));
     }
@@ -208,6 +216,81 @@ mod tests {
             .expect("read history file");
         assert!(content.contains("**Session key:** explicit-session"));
         assert!(!content.contains("**Session key:** chatgpt-session"));
+    }
+
+    #[test]
+    fn history_bootstrap_mcp_content_is_concise_instead_of_mirroring_structured_context() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state_dir = workspace.path().join("docs/history-state");
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let marker = format!("PRIVATE_PROJECT_STATE_MARKER:{}", "S".repeat(6_000));
+        fs::write(state_dir.join("PROJECT_STATE.md"), &marker).expect("write project state");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "history_session_bootstrap",
+                    "arguments": {"session_key": "compact-history"}
+                }
+            }),
+        );
+        let result = &response["result"];
+        let structured = &result["structuredContent"];
+        let model_text = result["content"][0]["text"].as_str().expect("model text");
+
+        assert_eq!(structured["ok"], true);
+        assert!(structured["project_state"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PRIVATE_PROJECT_STATE_MARKER"));
+        assert!(!model_text.contains("PRIVATE_PROJECT_STATE_MARKER"));
+        assert!(!model_text.trim_start().starts_with('{'));
+        assert!(model_text.len() < 1_024);
+        assert!(
+            serde_json::to_vec(structured)
+                .expect("serialize structured bootstrap")
+                .len()
+                < 14 * 1024
+        );
+    }
+
+    #[test]
+    fn read_file_mcp_content_remains_human_readable_after_json_mirror_removal() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        fs::write(workspace.path().join("sample.txt"), "plain file body")
+            .expect("write sample file");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_file",
+                    "arguments": {"path": "sample.txt"}
+                }
+            }),
+        );
+        assert_eq!(response["result"]["content"][0]["text"], "plain file body");
+        assert_eq!(
+            response["result"]["structuredContent"]["content"],
+            "plain file body"
+        );
     }
 
     #[test]

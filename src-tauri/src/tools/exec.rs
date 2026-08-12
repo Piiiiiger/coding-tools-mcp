@@ -297,7 +297,11 @@ async fn run_command(
         if session.has_exited() {
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
+            // Keep completed output briefly so output_refs remain usable after
+            // a fast-exiting command. The MCP envelope may intentionally
+            // compact large stdout/stderr, so read_output is the lossless
+            // continuation path for clients that need the remaining bytes.
+            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
         }
         if !tty && Instant::now() >= deadline {

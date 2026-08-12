@@ -346,6 +346,41 @@ fn retained_session_timeout_stops_the_process_after_deadline() {
 }
 
 #[test]
+fn fast_exit_command_keeps_output_ref_readable() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} -c \"print('R' * 20000)\""),
+            "filesystem_scope": "workspace",
+            "max_output_bytes": 1024
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["status"], "exited");
+    assert_eq!(payload["command_ok"], true);
+    let output_ref = payload["output_refs"]["stdout"]
+        .as_str()
+        .expect("stdout output ref");
+
+    let recovered = invoke(
+        &ctx,
+        "read_output",
+        json!({"output_ref": output_ref, "offset": 0, "limit": 4096}),
+    );
+    let recovered = assert_ok(&recovered);
+    assert_eq!(recovered["offset"], 0);
+    assert_eq!(recovered["next_offset"], 4096);
+    assert_eq!(recovered["total_stream_bytes"], 20001);
+    assert!(recovered["content"]
+        .as_str()
+        .expect("recovered stdout")
+        .starts_with("RRRR"));
+}
+
+#[test]
 fn killed_session_reports_command_failure_even_when_transport_succeeds() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

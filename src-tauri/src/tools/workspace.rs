@@ -3,6 +3,16 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+/// Maximum serialized `structuredContent` returned by one model-facing tool
+/// call. Small payloads are preserved exactly; only oversized payloads are
+/// compacted. This is intentionally close to the model-text budget so a single
+/// tool call cannot silently contribute hundreds of KiB of hidden context.
+pub(crate) const MCP_STRUCTURED_CONTENT_LIMIT_BYTES: usize = 2 * 1024;
+const MCP_BOOTSTRAP_STRUCTURED_CONTENT_LIMIT_BYTES: usize = 8 * 1024;
+const MCP_STRUCTURED_STRING_PREVIEW_BYTES: usize = 256;
+const MCP_STRUCTURED_ARRAY_PREVIEW_ITEMS: usize = 2;
+const MCP_STRUCTURED_OBJECT_PREVIEW_KEYS: usize = 24;
+
 pub const DEFAULT_EXCLUDED_NAMES: &[&str] = &[
     ".git",
     ".reference",
@@ -461,7 +471,16 @@ pub fn tool_err_code(
 }
 
 pub fn wrap_tool_result(structured: Value) -> Value {
-    wrap_mcp_tool_result("", &serde_json::json!({}), structured)
+    let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
+    let text = crate::tools::result_text::render_tool_text("", &structured, is_error);
+    json!({
+        "content": [{
+            "type": "text",
+            "text": text
+        }],
+        "structuredContent": structured,
+        "isError": is_error
+    })
 }
 
 pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) -> Value {
@@ -489,9 +508,364 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
             "text": text
         })]
     };
+    let structured_content = compact_mcp_structured_content(tool_name, structured);
     json!({
         "content": content,
-        "structuredContent": structured,
+        "structuredContent": structured_content,
         "isError": is_error
     })
+}
+
+fn compact_mcp_structured_content(tool_name: &str, structured: Value) -> Value {
+    let budget_bytes = if tool_name == "history_session_bootstrap" {
+        MCP_BOOTSTRAP_STRUCTURED_CONTENT_LIMIT_BYTES
+    } else {
+        MCP_STRUCTURED_CONTENT_LIMIT_BYTES
+    };
+    let original_bytes = serialized_json_bytes(&structured);
+    if original_bytes <= budget_bytes {
+        return structured;
+    }
+
+    let mut compacted = compact_json_value(
+        &structured,
+        0,
+        MCP_STRUCTURED_STRING_PREVIEW_BYTES,
+        MCP_STRUCTURED_ARRAY_PREVIEW_ITEMS,
+        MCP_STRUCTURED_OBJECT_PREVIEW_KEYS,
+    );
+    annotate_mcp_compaction(&mut compacted, tool_name, original_bytes, budget_bytes);
+    if serialized_json_bytes(&compacted) <= budget_bytes {
+        return compacted;
+    }
+
+    let fallback =
+        essential_mcp_structured_content(tool_name, &structured, original_bytes, budget_bytes);
+    if serialized_json_bytes(&fallback) <= budget_bytes {
+        return fallback;
+    }
+
+    minimal_mcp_structured_content(tool_name, &structured, original_bytes, budget_bytes)
+}
+
+fn compact_json_value(
+    value: &Value,
+    depth: usize,
+    string_limit: usize,
+    array_limit: usize,
+    object_limit: usize,
+) -> Value {
+    if depth >= 5 {
+        return match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+            Value::String(text) => Value::String(truncate_utf8(text, string_limit)),
+            Value::Array(items) => json!({ "mcp_items_omitted": items.len() }),
+            Value::Object(map) => json!({ "mcp_keys_omitted": map.len() }),
+        };
+    }
+
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(text) => Value::String(truncate_utf8(text, string_limit)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(array_limit)
+                .map(|item| {
+                    compact_json_value(item, depth + 1, string_limit, array_limit, object_limit)
+                })
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut output = serde_json::Map::new();
+            for (key, item) in map.iter().take(object_limit) {
+                output.insert(
+                    key.clone(),
+                    compact_json_value(item, depth + 1, string_limit, array_limit, object_limit),
+                );
+            }
+            Value::Object(output)
+        }
+    }
+}
+
+fn essential_mcp_structured_content(
+    tool_name: &str,
+    structured: &Value,
+    original_bytes: usize,
+    budget_bytes: usize,
+) -> Value {
+    const METADATA_KEYS: &[&str] = &[
+        "ok",
+        "status",
+        "summary",
+        "error",
+        "path",
+        "encoding",
+        "start_line",
+        "end_line",
+        "total_lines",
+        "total_bytes",
+        "bytes_read",
+        "truncated",
+        "truncated_by",
+        "query",
+        "total_matches",
+        "session_id",
+        "interactive",
+        "stdin_open",
+        "termination_reason",
+        "recoverable",
+        "suggestion",
+        "exit_code",
+        "transport_ok",
+        "command_ok",
+        "stdout_truncated",
+        "stderr_truncated",
+        "elapsed_ms",
+        "output_refs",
+        "output_ref",
+        "stream_output_ref",
+        "stream",
+        "offset",
+        "requested_offset",
+        "limit",
+        "cursor",
+        "next_offset",
+        "next_cursor",
+        "content_hash",
+        "number",
+        "total_retained_bytes",
+        "total_stream_bytes",
+        "branch",
+        "head",
+        "ahead",
+        "behind",
+        "is_repo",
+        "operation_id",
+        "warnings",
+        "session_key",
+        "session_key_source",
+        "platform_conversation_id",
+        "current_number",
+        "current_path",
+        "created",
+        "resumed",
+        "initial_input_captured",
+        "sequence_valid",
+        "history_count",
+        "total_history_bytes",
+        "state_revision",
+        "archive_revision",
+        "history_read_mode",
+        "persistence_mode",
+        "checkpoint_policy",
+        "search_guide",
+        "required_next_actions",
+        "state",
+    ];
+    const PREVIEW_KEYS: &[&str] = &[
+        "content", "stdout", "stderr", "diff", "preview", "matches", "entries", "files", "commits",
+        "lines", "results",
+    ];
+
+    let mut output = serde_json::Map::new();
+    for key in METADATA_KEYS {
+        if let Some(value) = structured.get(*key) {
+            output.insert((*key).to_string(), compact_json_value(value, 0, 256, 2, 12));
+        }
+    }
+    for key in PREVIEW_KEYS {
+        if let Some(value) = structured.get(*key) {
+            output.insert((*key).to_string(), compact_json_value(value, 0, 256, 2, 12));
+        }
+    }
+    let mut compacted = Value::Object(output);
+    annotate_mcp_compaction(&mut compacted, tool_name, original_bytes, budget_bytes);
+    compacted
+}
+
+fn minimal_mcp_structured_content(
+    tool_name: &str,
+    structured: &Value,
+    original_bytes: usize,
+    budget_bytes: usize,
+) -> Value {
+    let mut output = serde_json::Map::new();
+    for key in [
+        "ok",
+        "status",
+        "path",
+        "session_id",
+        "termination_reason",
+        "exit_code",
+        "output_refs",
+        "output_ref",
+        "next_offset",
+        "cursor",
+        "next_cursor",
+        "content_hash",
+        "number",
+        "session_key",
+        "session_key_source",
+        "current_number",
+        "current_path",
+        "history_read_mode",
+    ] {
+        if let Some(value) = structured.get(key) {
+            output.insert(key.to_string(), compact_json_value(value, 0, 128, 2, 8));
+        }
+    }
+    if let Some(summary) = structured
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        output.insert("summary".into(), Value::String(truncate_utf8(summary, 256)));
+    }
+    let mut compacted = Value::Object(output);
+    annotate_mcp_compaction(&mut compacted, tool_name, original_bytes, budget_bytes);
+    compacted
+}
+
+fn annotate_mcp_compaction(
+    value: &mut Value,
+    tool_name: &str,
+    original_bytes: usize,
+    budget_bytes: usize,
+) {
+    let Value::Object(map) = value else {
+        *value = json!({
+            "mcp_result_truncated": true,
+            "mcp_result_original_bytes": original_bytes,
+            "mcp_result_budget_bytes": budget_bytes,
+            "mcp_result_tool": tool_name,
+            "mcp_result_note": "structuredContent compacted; request narrower or paged output for more detail"
+        });
+        return;
+    };
+    map.insert("mcp_result_truncated".into(), Value::Bool(true));
+    map.insert(
+        "mcp_result_original_bytes".into(),
+        Value::Number((original_bytes as u64).into()),
+    );
+    map.insert(
+        "mcp_result_budget_bytes".into(),
+        Value::Number((budget_bytes as u64).into()),
+    );
+    if !tool_name.is_empty() {
+        map.insert(
+            "mcp_result_tool".into(),
+            Value::String(tool_name.to_string()),
+        );
+    }
+    map.insert(
+        "mcp_result_note".into(),
+        Value::String(
+            "structuredContent compacted; request narrower or paged output for more detail".into(),
+        ),
+    );
+}
+
+fn serialized_json_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let suffix = "…";
+    let mut end = max_bytes.saturating_sub(suffix.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut output = value[..end].to_string();
+    output.push_str(suffix);
+    output
+}
+
+#[cfg(test)]
+mod result_budget_tests {
+    use serde_json::json;
+
+    use super::{wrap_mcp_tool_result, MCP_STRUCTURED_CONTENT_LIMIT_BYTES};
+
+    #[test]
+    fn small_structured_content_is_preserved_exactly() {
+        let structured = json!({
+            "ok": true,
+            "path": "small.txt",
+            "content": "small body",
+            "truncated": false
+        });
+
+        let wrapped = wrap_mcp_tool_result("read_file", &json!({}), structured.clone());
+
+        assert_eq!(wrapped["structuredContent"], structured);
+    }
+
+    #[test]
+    fn oversized_structured_content_is_bounded_and_keeps_continuation_metadata() {
+        let structured = json!({
+            "ok": true,
+            "status": "exited",
+            "exit_code": 0,
+            "stdout": "x".repeat(100_000),
+            "stderr": "y".repeat(40_000),
+            "stdout_truncated": true,
+            "stderr_truncated": true,
+            "output_refs": {
+                "stdout": "session:test:stdout",
+                "stderr": "session:test:stderr"
+            }
+        });
+
+        let wrapped = wrap_mcp_tool_result("exec_command", &json!({}), structured);
+        let compacted = &wrapped["structuredContent"];
+        let bytes = serde_json::to_vec(compacted)
+            .expect("serialize compacted structured content")
+            .len();
+
+        assert!(bytes <= MCP_STRUCTURED_CONTENT_LIMIT_BYTES);
+        assert_eq!(compacted["mcp_result_truncated"], true);
+        assert!(
+            compacted["mcp_result_original_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > MCP_STRUCTURED_CONTENT_LIMIT_BYTES as u64
+        );
+        assert_eq!(compacted["exit_code"], 0);
+        assert_eq!(compacted["output_refs"]["stdout"], "session:test:stdout");
+        assert_eq!(compacted["output_refs"]["stderr"], "session:test:stderr");
+    }
+
+    #[test]
+    fn oversized_history_read_keeps_lossless_paging_metadata() {
+        let structured = json!({
+            "ok": true,
+            "number": 20,
+            "path": "docs/history-session/20.md",
+            "content": "历史正文".repeat(10_000),
+            "cursor": 4096,
+            "next_cursor": 8192,
+            "total_bytes": 50000,
+            "content_hash": "sha256:stable"
+        });
+
+        let wrapped = wrap_mcp_tool_result("history_session_read", &json!({}), structured);
+        let compacted = &wrapped["structuredContent"];
+        let bytes = serde_json::to_vec(compacted)
+            .expect("serialize compacted history read")
+            .len();
+
+        assert!(bytes <= MCP_STRUCTURED_CONTENT_LIMIT_BYTES);
+        assert_eq!(compacted["mcp_result_truncated"], true);
+        assert_eq!(compacted["number"], 20);
+        assert_eq!(compacted["cursor"], 4096);
+        assert_eq!(compacted["next_cursor"], 8192);
+        assert_eq!(compacted["content_hash"], "sha256:stable");
+    }
 }

@@ -1,6 +1,11 @@
 use serde_json::Value;
 
-const MODEL_TEXT_SAFETY_LIMIT_BYTES: usize = (2 * 1_048_576) + 65_536;
+/// Hard ceiling for model-facing text emitted by one MCP tool result.
+///
+/// Large tool bodies remain recoverable through the tool's own paging/range
+/// arguments. Keeping this small prevents a handful of read/exec/git calls
+/// from consuming an entire ChatGPT conversation context.
+pub(crate) const MODEL_TEXT_SAFETY_LIMIT_BYTES: usize = 4 * 1024;
 
 pub fn render_tool_text(tool_name: &str, payload: &Value, is_error: bool) -> String {
     let rendered = if is_error || payload.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -11,6 +16,8 @@ pub fn render_tool_text(tool_name: &str, payload: &Value, is_error: bool) -> Str
             "history_session_bootstrap" => render_history_bootstrap(payload),
             "history_session_checkpoint" => render_history_checkpoint(payload),
             "history_session_validate" => render_history_validate(payload),
+            "history_session_search" => render_history_search(payload),
+            "history_session_read" => render_history_read(payload),
             "check_exec_environment" => render_exec_environment(payload),
             "get_default_cwd" | "set_default_cwd" => render_cwd(payload),
             "read_file" => render_read_file(payload),
@@ -44,6 +51,53 @@ pub fn render_tool_text(tool_name: &str, payload: &Value, is_error: bool) -> Str
         }
     };
     bounded_model_text(&rendered, tool_name)
+}
+
+fn render_history_search(payload: &Value) -> String {
+    let query = string_value(payload, "query").unwrap_or("");
+    let total = payload
+        .get("total_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cursor = payload.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+    let next_cursor = payload
+        .get("next_cursor")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into());
+    let mut lines = vec![format!(
+        "History search: query={query:?}; total={total}; cursor={cursor}; next_cursor={next_cursor}."
+    )];
+    if let Some(results) = payload.get("results").and_then(Value::as_array) {
+        for result in results {
+            let number = result.get("number").and_then(Value::as_u64).unwrap_or(0);
+            let path = string_value(result, "path").unwrap_or("unknown");
+            let title = string_value(result, "title").unwrap_or("");
+            let snippet = string_value(result, "snippet").unwrap_or("");
+            lines.push(format!("#{number} {path} — {title}\n{snippet}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_history_read(payload: &Value) -> String {
+    let number = payload.get("number").and_then(Value::as_u64).unwrap_or(0);
+    let path = string_value(payload, "path").unwrap_or("unknown");
+    let cursor = payload.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+    let next_cursor = payload
+        .get("next_cursor")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into());
+    let total_bytes = payload
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let content_hash = string_value(payload, "content_hash").unwrap_or("unknown");
+    let content = string_value(payload, "content").unwrap_or("");
+    format!(
+        "History archive #{number}: {path}\ncursor={cursor}; next_cursor={next_cursor}; total_bytes={total_bytes}; content_hash={content_hash}\n{content}"
+    )
 }
 
 fn render_error(payload: &Value) -> String {
@@ -409,7 +463,7 @@ fn bounded_model_text(value: &str, tool_name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::render_tool_text;
+    use super::{render_tool_text, MODEL_TEXT_SAFETY_LIMIT_BYTES};
 
     #[test]
     fn history_bootstrap_text_does_not_mirror_structured_history() {
@@ -426,5 +480,68 @@ mod tests {
         assert!(text.contains("42 prior session"));
         assert!(!text.contains("VERY_LARGE_PRIVATE_STATE_SHOULD_STAY_STRUCTURED"));
         assert!(!text.contains("VERY_LARGE_LATEST_DELTA_SHOULD_STAY_STRUCTURED"));
+    }
+
+    #[test]
+    fn large_read_file_model_text_is_bounded() {
+        let payload = json!({
+            "ok": true,
+            "path": "large.txt",
+            "content": "界".repeat(20_000),
+            "start_line": 1,
+            "end_line": 1,
+            "total_lines": 1,
+            "truncated": false
+        });
+
+        let text = render_tool_text("read_file", &payload, false);
+
+        assert!(text.len() <= MODEL_TEXT_SAFETY_LIMIT_BYTES);
+        assert!(text.contains("model text reached"));
+        assert!(text.contains("retry with narrower paths or limits"));
+    }
+
+    #[test]
+    fn history_read_model_text_keeps_page_content_and_continuation_cursor() {
+        let payload = json!({
+            "ok": true,
+            "number": 20,
+            "path": "docs/history-session/20.md",
+            "content": "历史正文 marker\n".repeat(400),
+            "cursor": 4096,
+            "next_cursor": 8192,
+            "total_bytes": 12000,
+            "content_hash": "sha256:test"
+        });
+
+        let text = render_tool_text("history_session_read", &payload, false);
+
+        assert!(text.len() <= MODEL_TEXT_SAFETY_LIMIT_BYTES);
+        assert!(text.contains("历史正文 marker"));
+        assert!(text.contains("next_cursor=8192"));
+        assert!(text.contains("content_hash=sha256:test"));
+    }
+
+    #[test]
+    fn history_search_model_text_keeps_hits_and_next_cursor() {
+        let payload = json!({
+            "ok": true,
+            "query": "FG-350",
+            "total_matches": 3,
+            "cursor": 0,
+            "next_cursor": 2,
+            "results": [{
+                "number": 20,
+                "path": "docs/history-session/20.md",
+                "title": "Read current project progress",
+                "snippet": "FG-350 exact CGF verification"
+            }]
+        });
+
+        let text = render_tool_text("history_session_search", &payload, false);
+
+        assert!(text.contains("next_cursor=2"));
+        assert!(text.contains("docs/history-session/20.md"));
+        assert!(text.contains("FG-350 exact CGF verification"));
     }
 }

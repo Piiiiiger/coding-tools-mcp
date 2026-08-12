@@ -294,6 +294,46 @@ mod tests {
     }
 
     #[test]
+    fn large_read_file_mcp_result_is_bounded_on_both_model_facing_channels() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        fs::write(
+            workspace.path().join("large.txt"),
+            "0123456789abcdef\n".repeat(10_000),
+        )
+        .expect("write large sample file");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_file",
+                    "arguments": {"path": "large.txt", "max_bytes": 131072}
+                }
+            }),
+        );
+        let result = &response["result"];
+        let model_text = result["content"][0]["text"].as_str().expect("model text");
+        let structured = &result["structuredContent"];
+        let structured_bytes = serde_json::to_vec(structured)
+            .expect("serialize structured content")
+            .len();
+
+        assert!(model_text.len() <= 4 * 1024);
+        assert!(structured_bytes <= crate::tools::workspace::MCP_STRUCTURED_CONTENT_LIMIT_BYTES);
+        assert_eq!(structured["mcp_result_truncated"], true);
+        assert_eq!(structured["path"], "large.txt");
+        assert!(structured["total_bytes"].as_u64().unwrap_or_default() > 100_000);
+    }
+
+    #[test]
     fn legacy_grep_calls_are_mapped_to_the_public_grep_text_tool() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");

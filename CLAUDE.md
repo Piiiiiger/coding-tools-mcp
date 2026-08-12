@@ -1,13 +1,18 @@
 <!-- mcp-probe:harness begin — auto-generated; do not edit -->
 ## MCP (mcp-probe-kit)
 
-Before coding, read the `mcp-probe:context` block in `AGENTS.md` or Skill `.agents/skills/mcp-probe-kit/SKILL.md`.
+> mcp-probe-kit-harness-adapter-version: 4.0.0-rc.20
+
+- If the user says only “continue”, “start”, or “keep going”, call `resume_plan` first. Pass `plan_id` when known; otherwise pass only `project_root` to recover the latest active/blocked Plan.
+- Before confirming there is no resumable Plan, do not inspect the workspace with Bash, call `workflow`, or restart with `start_*`.
+- When `resume_plan` returns `mustContinue=true`, do not stop after reporting recovery. Execute `nextStep/nextTool` immediately, call `plan_heartbeat` after each step, and continue until blocked, cancelled, or converged.
+- For all other work, read the `mcp-probe:context` block in `AGENTS.md` or Skill `.agents/skills/mcp-probe-kit/SKILL.md` before coding.
 <!-- mcp-probe:harness end -->
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **coding-tools-mcp** (2497 symbols, 5234 relationships, 210 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **coding-tools-mcp** (3598 symbols, 7608 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

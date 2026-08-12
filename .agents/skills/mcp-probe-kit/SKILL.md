@@ -1,20 +1,22 @@
 ---
 name: mcp-probe-kit
 description: >-
-  在已配置 mcp-probe-kit 的项目中，于新功能、Bug、UI、重构或提交前读取；统一选择首个 MCP、汇总当前对话构造完整参数，并让复杂功能通过 start_feature 自动采用 flat 或 parent-child Spec。仅负责工具路由与参数纪律，不承载完整研发流程。Routes coding intent, builds complete MCP arguments, and selects flat or parent-child specs for complex features.
-mcp-probe-kit-version: "4.0.0-rc.8"
+  在已配置 mcp-probe-kit 的项目中，于新功能、Bug、UI、重构或提交前读取；区分独立能力与完整交付编排，汇总当前对话构造完整参数，并在不确定首工具时提供 workflow 兜底。完整新功能由 start_feature 选择 flat 或 parent-child Spec；Skill 不承担中央意图识别，start_* 只组合当前场景实际需要的能力。
+mcp-probe-kit-version: "4.0.0-rc.20"
 ---
 
 # MCP 调用时机 — mcp-probe-kit
 
-> 本 Skill 负责：**什么情况调哪个 MCP，以及调用前如何构造完整参数**。不是开发流程剧本。
+> 本 Skill 负责：**什么情况直接调用独立能力，什么情况使用完整交付编排，以及调用前如何构造完整参数**。不是中央意图识别器。
 > 由 mcp-probe-kit 自动安装；支持 MCP 的 Agent 客户端可从 `.agents/skills/` 加载。
 
 ## 总规则
 
-1. **先查下表**，有对应 MCP 就先调，再写代码 / 改文件
-2. **拿不准** → `workflow`：`{ "intent": "<结合当前对话整理的完整任务摘要>" }`
-3. `start_*` 会列出后续该调的 MCP；按返回逐步调用即可
+1. **先判断目标**：明确单项能力直接调用对应工具；需要从分析到验证完整交付时才调用 `start_*`
+2. **独立能力不是必须被编排**：`code_insight`、`fix_bug`、`gentest`、`code_review`、Memory 等均可直接调用
+3. **只有拿不准该调用哪个工具时**才调用 `workflow`。`workflow` 是兜底选择指南，不做自然语言意图识别；默认 `scenario=auto` 不会根据 `intent` 猜 `firstTool`。Agent 阅读指南和 tool descriptions 后自行判断，缺关键事实时再澄清用户
+4. `start_*` 只组合当前场景实际需要的能力；按返回的 Delegated Plan 逐步执行，不要额外塞入无关工具
+5. 在写代码或改文件前，先完成当前目标真正需要的理解、规格或根因步骤
 
 ## 执行通道与自动降级
 
@@ -24,7 +26,7 @@ mcp-probe-kit-version: "4.0.0-rc.8"
 
 ### 降级：项目 CLI
 
-如果 MCP 面板已连接，但当前 Agent 会话看不到上述 MCP 工具，不要跳过 mcp-probe-kit 工作流，也不要要求用户安装。直接通过终端调用项目内版本锁定启动器：
+如果 MCP 面板已连接，但当前 Agent 会话看不到上述 MCP 工具，不要放弃当前目标所需的 mcp-probe-kit 能力，也不要要求用户安装。直接通过终端调用项目内版本锁定启动器：
 
 Windows（PowerShell / CMD，优先使用不受脚本执行策略影响的 CMD 启动器）：
 
@@ -47,16 +49,16 @@ CLI 返回 JSON；读取 `structuredContent`、`content` 和 `isError`，继续�
 Windows：
 
 ```powershell
-npx.cmd --yes mcp-probe-kit@4.0.0-rc.8 install-agent --project-root .
+npx.cmd --yes mcp-probe-kit@4.0.0-rc.20 install-agent --project-root .
 ```
 
 macOS / Linux：
 
 ```bash
-npx --yes mcp-probe-kit@4.0.0-rc.8 install-agent --project-root .
+npx --yes mcp-probe-kit@4.0.0-rc.20 install-agent --project-root .
 ```
 
-安装后立即改用项目内启动器。不得使用 `@latest` 或 `@next`，不得全局安装，也不得修改用户项目的 `package.json`。Skill、CLI 启动器和 MCP 必须保持同一精确版本 `4.0.0-rc.8`。
+安装后立即改用项目内启动器。不得使用 `@latest` 或 `@next`，不得全局安装，也不得修改用户项目的 `package.json`。Skill、CLI 启动器和 MCP 必须保持同一精确版本 `4.0.0-rc.20`。
 
 ### GitNexus 托管运行时
 
@@ -82,57 +84,63 @@ macOS / Linux：
 
 ## 参数构造纪律
 
-- 用户只说“继续 / 开始 / 往下做”时，先结合当前对话、已有 Spec 和用户已确认决定，重建完整任务摘要；禁止把短确认语原样传给 `workflow.intent` 或 `start_*.description`。
-- 新功能默认调用 `start_feature`，并传 `description=<完整范围摘要>`、`spec_layout=auto` 和明确的 `project_root`；让编排器决定 flat 或 parent-child。
+- 用户只说“继续 / 开始 / 往下做”且存在最近的 Delegated Plan 或已知 plan_id 时，直接调用 `resume_plan` 恢复检查点并从 nextStepId 继续；`mustContinue=true` 时禁止只汇报恢复结果，必须立即执行 nextStep/nextTool 并逐步 heartbeat；plan_id 丢失时只传 project_root，由工具自动选择最近的 active/blocked Plan；只有不存在可恢复 Plan 时，才结合当前对话、已有 Spec 和用户已确认决定下一工具。不要先调用 `workflow` 做意图识别。
+- 先判断当前目标是一个明确的单项能力，还是需要完整交付；单项能力直接调用对应工具，完整交付才使用 `start_*`。
+- 完整新功能交付调用 `start_feature`，并传 `description=<完整范围摘要>`、`spec_layout=auto` 和明确的 `project_root`；让编排器决定 flat 或 parent-child。
 - 跨模块、多阶段、大版本或架构升级不得直接调用 `add_feature`；只有布局和 `subspecs` 已明确时，才按 `start_feature` 返回的 plan 调用它。
 - 工具参数必须表达当前任务事实，不要只复制用户最后一条消息；当前项目代码和已落盘 Spec 优先于历史记忆。
-- 拿到 Delegated Plan 后首次调用 `plan_heartbeat` 时附完整 plan；每完成、跳过或阻塞步骤后更新检查点。
+- 只有需要持续状态、跨会话恢复或正式交付的 Delegated Plan 才要求 `plan_heartbeat`；单次只读分析不强制创建 Plan。
+- 拿到托管 Delegated Plan 后首次调用 `plan_heartbeat` 时附完整 plan；每完成、跳过或阻塞步骤后更新检查点。
 
 ---
 
-## 意图速查（第一个该调的 MCP）
+## 工具选择速查（由 Agent 判断）
 
 | 用户说什么 / 什么情况 | 第一个 MCP |
 |----------------------|------------|
-| 新功能、加模块、做需求 | `start_feature` |
-| Bug、报错、异常、排查、不生效 | `start_bugfix` |
-| 页面、组件、样式、UI、交互 | `start_ui` |
-| 不熟代码、架构、调用链、影响面 | `code_insight` |
-| 新项目上手、熟悉仓库 | `start_onboard` |
-| 产品方案、PRD、原型 | `start_product` |
-| 长周期自主迭代（Ralph） | `start_ralph` |
-| 缺 AGENTS.md / 项目上下文 | `init_project_context` |
-| 全新空仓库脚手架 | `init_project` |
+| 完整交付新功能、功能增强或跨模块能力 | `start_feature` |
+| 完整修复 Bug，并完成回归、审查和收敛 | `start_bugfix` |
+| 只做 Bug 根因分析或使用 SRC-8 方法 | `fix_bug` |
+| 架构评估、架构设计、数据所有权、迁移回滚或架构漂移 | `architecture` |
+| 完整交付页面、组件或 UI 交互 | `start_ui` |
+| 只查 UI 模式或生成设计系统 | `ui_search / ui_design_system` |
+| 不熟代码、找入口、调用链、依赖或影响面 | `code_insight` |
+| 只生成测试策略、测试设计或候选用例 | `gentest` |
+| 只审查指定代码、真实 diff 或 PR | `code_review` |
+| 新成员上手、熟悉仓库和开发上下文 | `start_onboard` |
+| 产品方案、PRD、目标用户、范围或原型方向 | `start_product` |
+| 需要有界多轮自主迭代并逐轮留证 | `start_ralph` |
+| 缺 AGENTS.md、项目上下文或图谱索引 | `init_project_context` |
+| 全新空仓库需要初始化项目结构 | `init_project` |
 | 写 commit message | `gencommit` |
-| 代码评审、安全检查 | `code_review` |
-| 重构、整理代码 | `refactor（大改前先 code_insight）` |
-| 估算工时、排期 | `estimate` |
-| 校验规格是否写全 | `check_spec` |
-| 查历史踩坑、可复用经验 | `search_memory` |
-| 需求不清楚、要澄清 | `ask_user 或 interview` |
-| 工作报告、周报、git 汇总 | `git_work_report` |
-| 不确定用哪个 MCP | `workflow` |
+| 重构、整理代码或制定重构步骤 | `refactor` |
+| 估算工时、故事点、排期或风险 | `estimate` |
+| 校验已有规格是否完整 | `check_spec` |
+| 查询历史踩坑、已保存方案或可复用经验 | `search_memory` |
+| 需求本身不清楚，缺关键事实，需要向用户提问 | `ask_user / interview` |
+| 工作报告、周报或 Git 工作汇总 | `git_work_report` |
+| 用户只说继续/开始/往下做且可能存在未完成 Plan | `resume_plan` |
 
 ---
 
 ## 全工具：何时调用
 
-### 编排入口 `start_*`（复杂任务的第一步）
+### 完整交付编排 `start_*`（按需使用）
 
 | MCP | 何时调用 |
 |-----|----------|
-| `start_feature` | 任何**新功能 / 增强 / 大版本升级**的首选入口；先把当前对话已确认的完整范围汇总到 description，默认 `spec_layout=auto`，复杂多模块需求先拆 parent-child 子规格，再指引 `add_feature` → `check_spec` → 实现 |
-| `start_bugfix` | 任何 **Bug / 报错**；指引 `fix_bug`（真因）→ `gentest` → 测试 |
-| `start_ui` | 任何 **UI / 页面 / 组件**；指引设计系统、模板检索、实现约束 |
+| `start_feature` | 需要从需求、规格、实施、测试、审查到收敛完成**完整新功能交付**时使用；先把当前对话确认的完整范围汇总到 description，默认 `spec_layout=auto`，复杂多模块需求使用 parent-child；仅做规格、影响分析或测试时可直接调用对应能力 |
+| `start_bugfix` | 需要从现象、SRC-8 真因、修复、回归、审查到收敛完成**完整 Bug 交付**时使用；只做根因分析时直接调用 `fix_bug` |
+| `start_ui` | 需要从视觉方向、页面结构、实现、桌面/移动验收到正式收敛完成**完整 UI 交付**时使用；只查模式或生成设计系统时直接调用 UI 能力 |
 | `start_onboard` | **新成员 / 新仓库**快速建立心智模型 |
 | `start_product` | 从 0 做**产品方案**（PRD、原型思路） |
-| `start_ralph` | 需要**多轮自主迭代**、长任务循环时 |
+| `start_ralph` | 需要**有界多轮迭代**、每轮 Heartbeat/测试/Diff 证据和最终 Converge 的完整长任务时；不用于后台无人值守循环 |
 
-### 路由
+### 可选首工具路由
 
 | MCP | 何时调用 |
 |-----|----------|
-| `workflow` | **不确定**该用哪个 MCP；或担心 Agent 跳过 MCP 直接写代码时。intent 必须是完整任务摘要，不是“继续/开始”等最后一句 |
+| `workflow` | Agent 阅读 Skill 和工具 description 后仍**不确定该调用哪个工具**时使用；`auto` 只返回选择指南，不做自然语言意图识别、不替 Agent 猜 firstTool。Agent 已明确场景时可显式传 scenario 获取该场景的确定性流程说明 |
 
 ### 项目与规格
 
@@ -149,9 +157,10 @@ macOS / Linux：
 | MCP | 何时调用 |
 |-----|----------|
 | `code_insight` | 读不懂代码、找入口、看**调用链 / 影响面**；大重构前；`mode=impact` 评估改动范围 |
-| `fix_bug` | 需要 **TBP 真因分析**指南（通常由 `start_bugfix` 触发） |
+| `architecture` | 需要评估或设计模块边界、依赖方向、数据所有权、公共契约、迁移回滚或实施漂移时直接调用；支持 `assess|design|validate|drift`，完整功能、Bug 和重构流程只按需组合它 |
+| `fix_bug` | 需要独立执行 **SRC-8 根因分析与修复方法**时直接调用；完整 Bug 交付中由 `start_bugfix` 编排或展开同一方法核心 |
 | `gentest` | 需要**补测试 / 回归用例**（Bug 修复后、功能完成后） |
-| `code_review` | 用户要**审查**指定文件或 diff（含安全项） |
+| `code_review` | 用户要审查指定代码、真实 Git diff，或核验 Plan 声明范围、测试、公共契约、架构漂移与当前 revision 是否一致 |
 | `refactor` | 需要**分步重构计划**；范围大时先 `code_insight` |
 
 ### Git
@@ -161,7 +170,7 @@ macOS / Linux：
 | `gencommit` | 变更完成，需要**规范 commit message** |
 | `git_work_report` | 需要基于 git 历史的**工作报告 / 周报** |
 
-### UI 子工具（通常由 `start_ui` 串联）
+### UI 独立能力（可直接调用，也可由 `start_ui` 组合）
 
 | MCP | 何时调用 |
 |-----|----------|
@@ -173,20 +182,20 @@ macOS / Linux：
 
 | MCP | 何时调用 |
 |-----|----------|
-| `search_memory` | 主动查**历史经验**；`start_*` 未覆盖时补查 |
+| `search_memory` | 主动查**历史经验**；默认只返回 active，审计失效记录时显式 `include_inactive=true`，并结合 ranking 解释核对证据与适用边界 |
 | `read_memory_asset` | `search_memory` 命中后需要**读全文** |
-| `memorize_asset` | 已有已验证 MemoryCandidate，且 **converge passed=true** 后正式沉淀成功或负面经验 |
-| `update_memory_asset` | 修正已有记忆条目 |
-| `delete_memory_asset` | 删除错误记忆（需 `confirm: true`） |
+| `memorize_asset` | 托管交付流程在 **converge passed=true** 后沉淀 MemoryCandidate；用户明确进行独立记忆管理时也可直接调用。默认拒绝同身份冲突，确认替代时用 `conflict_policy=supersede`，确需并行结论时显式 `allow_parallel` |
+| `update_memory_asset` | 修正已有记忆、撤回错误结论或建立 supersede 关系；历史关系不可清除，retracted/负面结论必须保留 evidence |
+| `delete_memory_asset` | 硬删除未关联的错误/重复/无价值资产（需 `confirm: true`）；参与 supersede 链的资产只能用 update_memory_asset 撤回 |
 | `scan_and_extract_patterns` | 从代码库**批量提取**可复用模式并建议沉淀 |
 
-### 计划状态、恢复与收敛
+### 长任务状态、恢复与正式收敛（按需）
 
 | MCP | 何时调用 |
 |-----|----------|
-| `plan_heartbeat` | 执行 Delegated Plan 后记录完成步骤、证据、未决事项和 revision；首次调用附完整 plan |
-| `resume_plan` | 会话中断、重启或切换 Agent 后，按 plan_id 恢复下一可执行步骤 |
-| `converge` | 实现与验证完成后，检查需求/规格/实现/测试/审查证据；通过后才正式沉淀记忆 |
+| `plan_heartbeat` | 执行需要持续状态、跨会话恢复或正式交付的 Delegated Plan 时记录步骤、证据、作用域、产物、候选、验收结果、运行证据和 revision；首次调用附完整 plan，单次只读能力不强制使用 |
+| `resume_plan` | 会话中断、重启、切换 Agent 或用户只说继续时恢复下一可执行步骤；已知 plan_id 时精确恢复，未知时省略 plan_id 自动选择最近 active/blocked Plan；found=true 且 mustContinue=true 后必须立即执行 nextStep，禁止只汇报恢复结果后停止 |
+| `converge` | 托管交付实现与验证完成后，按 Plan 自己声明的 requiredEvidenceKinds（例如需求、测试、审查）、qualityGates、步骤和未决项进行收敛；通过后才允许该流程正式沉淀记忆。单次只读分析和独立记忆管理不强制进入收敛 |
 
 ### 交互
 
@@ -201,9 +210,15 @@ macOS / Linux：
 
 **新功能**：`start_feature → plan_heartbeat → add_feature → check_spec（通过）→ 写代码 → gentest → code_review → converge（通过）→ memorize_asset（可选）→ gencommit`
 
-**修 Bug**：`start_bugfix → plan_heartbeat → fix_bug → 改代码 → gentest → 跑测试 → code_review → converge（通过）→ memorize_asset（成功或负面记忆）`
+**完整修 Bug**：`start_bugfix（编排并展开 fix_bug / SRC-8）→ plan_heartbeat → 改代码 → gentest → 跑测试 → code_review → converge（通过）→ memorize_asset（成功或负面记忆）`
 
-**不熟代码**：`code_insight → 再 start_feature / start_bugfix`
+**只做根因分析**：`fix_bug；不要求先 start_bugfix，不要求建立完整 Plan`
+
+**只理解代码**：`code_insight；若后续转为完整交付，再进入对应 start_*`
+
+**只设计测试**：`gentest；测试候选生成后仍需由 Agent 真实落盘和执行`
+
+**独立架构工作**：`architecture assess → architecture design（按需）→ validate / drift；不要求先 start_*`
 
 **大重构**：`code_insight（impact）→ refactor → plan_heartbeat → gentest → code_review → converge`
 
@@ -214,14 +229,16 @@ macOS / Linux：
 ## 不要
 
 - 有对应 MCP 却**直接大段写实现**
-- 把用户的“继续 / 开始 / 往下做”原样当作 `workflow.intent` 或 `start_feature.description`
+- 把 `workflow` 当作所有任务的强制入口
+- 把 `start_*` 当作所有原子能力的上级，导致单项分析也被强制套入完整流程
+- 把用户的“继续 / 开始 / 往下做”交给 `workflow` 做意图识别，或原样当作 `start_feature.description`
 - 大型跨模块需求绕过 `start_feature` 直接手写单体 Spec
 - `check_spec` **未通过**就写功能代码
 - 长流程执行步骤后**不** `plan_heartbeat`，导致中断后无法恢复
-- `converge` 未通过就把候选经验正式写入 `memorize_asset`
+- 托管交付流程在 `converge` 未通过时就把候选经验正式写入 `memorize_asset`
 - `delete_memory_asset` 不带 `confirm: true`
 
 ---
 
-*mcp-probe-kit 按版本自动同步（当前 `4.0.0-rc.8`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
+*mcp-probe-kit 按版本自动同步（当前 `4.0.0-rc.20`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
 

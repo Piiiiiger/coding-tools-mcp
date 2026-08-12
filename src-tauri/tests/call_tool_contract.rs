@@ -208,11 +208,13 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 24);
+    assert_eq!(names.len(), 26);
     assert!(names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
+    assert!(names.contains("history_session_search"));
+    assert!(names.contains("history_session_read"));
     assert!(!names.contains("harness_status"));
     assert!(!names.contains("start_task"));
 }
@@ -442,7 +444,12 @@ fn search_text_skips_binary_and_oversized_files() {
     );
     let oversized_payload = assert_ok(&oversized);
     assert_eq!(oversized_payload["total_matches"].as_u64().unwrap_or(1), 0);
-    assert!(oversized_payload["skipped_large_files"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        oversized_payload["skipped_large_files"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
     assert!(oversized_payload["warnings"]
         .as_array()
         .into_iter()
@@ -460,7 +467,10 @@ fn search_text_stops_after_max_results() {
         json!({"query": "common-token", "glob": "search/**", "max_results": 2}),
     );
     let payload = assert_ok(&out);
-    assert_eq!(payload["matches"].as_array().map(|a| a.len()).unwrap_or(0), 2);
+    assert_eq!(
+        payload["matches"].as_array().map(|a| a.len()).unwrap_or(0),
+        2
+    );
     assert!(payload["truncated"].as_bool().unwrap_or(false));
     assert!(payload["warnings"]
         .as_array()

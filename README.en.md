@@ -205,15 +205,17 @@ Chat transcripts are useful for rereading a discussion, but they are a poor long
 
 *Paste the full prompt into a new conversation to initialize or restore history, then save a checkpoint after each completed task.*
 
-Three tools work together:
+Five tools work together:
 
 | Tool | Purpose |
 | --- | --- |
-| `history_session_bootstrap` | Initialize or restore a project session; a new file embeds a compressed summary of prior sessions and returns a stable `session_key` and `current_path` |
-| `history_session_checkpoint` | Save structured progress to the stable target returned by bootstrap; reject mismatched targets instead of writing to another history file |
+| `history_session_bootstrap` | Initialize or restore a project session; preserve verbatim `initial_user_input` and return a stable `session_key`, `current_path`, and bounded current state instead of all history |
+| `history_session_checkpoint` | Append structured progress and verbatim `raw_user_input` to the stable target returned by bootstrap; reject mismatched targets instead of writing to another history file |
 | `history_session_validate` | Validate numbering, history files, and session mappings; rebuild derived indexes when needed without deleting existing history |
+| `history_session_search` | Search lossless Markdown archives by deterministic keywords and return a bounded page of locations and snippets |
+| `history_session_read` | Read one original Markdown archive losslessly in UTF-8-safe pages by number or a search result path; pages default to `32 KiB`, are capped at `64 KiB`, and continue with `next_cursor` |
 
-History uses readable Markdown that can be backed up or committed with the project. Every new file starts with a bounded inherited summary that is not recursively copied into later summaries. Checkpoints are idempotent, and progress should only be reported as saved after the tool returns `ok=true` with the same session target.
+History uses readable Markdown that can be backed up or committed with the project. `memory/state.json` is a bounded current-state projection, while `memory/manifest.json` stores only archive locations, hashes, and keywords; Markdown remains the lossless source of truth. ChatGPT must pass verbatim first-turn and per-turn text as `initial_user_input` and `raw_user_input`, because the server cannot inspect remote chat text that was not provided as a tool argument. Checkpoints are idempotent, changed content for the same `turn_id` is retained as a revision with supersession evidence, and progress should only be reported as saved after the tool returns `ok=true` with the same session target.
 
 > History persistence is performed when the AI calls the MCP tools; the desktop app does not record chat content in the background. If the client does not invoke a tool, the server cannot infer that a new conversation or task has happened.
 
@@ -228,7 +230,7 @@ The default `core` profile provides a stable, composable development tool set:
 | Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
 | Environment | `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd` |
-| History sessions | `history_session_bootstrap`, `history_session_checkpoint`, `history_session_validate` |
+| History sessions | `history_session_bootstrap`, `history_session_checkpoint`, `history_session_validate`, `history_session_search`, `history_session_read` |
 
 A typical development loop is:
 

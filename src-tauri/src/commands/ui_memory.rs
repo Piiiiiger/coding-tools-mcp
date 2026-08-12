@@ -109,6 +109,7 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
         .ok_or_else(|| AppError::Message("no webview window to recreate".into()))?;
 
     let label = window.label().to_string();
+    let was_hidden = !window.is_visible().unwrap_or(true);
     let was_minimized = window.is_minimized().unwrap_or(false);
     let is_maximized = window.is_maximized().unwrap_or(false);
 
@@ -116,6 +117,8 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     // report outer_position ≈ (-32000, -32000); restoring that parks the new
     // window off-screen so the taskbar icon appears dead.
     let _ = window.unminimize();
+    // Briefly show so geometry reads are sane; tray-hidden windows are re-hidden
+    // after rebuild (see was_hidden below).
     let _ = window.show();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -180,22 +183,27 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
         let _ = new_window.center();
     }
 
-    // Establish a normal on-screen window first so later minimize (if any) is restorable.
+    // Establish a normal on-screen window first so later minimize/hide is restorable.
     let _ = new_window.unminimize();
     let _ = new_window.show();
-    if is_maximized && !was_minimized {
+    if is_maximized && !was_minimized && !was_hidden {
         let _ = new_window.maximize();
     }
-    let _ = new_window.set_focus();
 
-    // Remove keepalive only after main is back and interactive.
+    // Remove keepalive only after main is back.
     let _ = keepalive.destroy();
 
-    // If the user had it minimized (silent memory refresh), put it back in the
-    // taskbar — but only after geometry is sane, so restore from taskbar works.
-    if was_minimized {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = new_window.minimize();
+    if was_hidden {
+        // Stay in tray: do not steal focus after a silent recreate.
+        let _ = new_window.hide();
+    } else {
+        let _ = new_window.set_focus();
+        // If the user had it minimized (silent memory refresh), put it back in the
+        // taskbar — but only after geometry is sane, so restore from taskbar works.
+        if was_minimized {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = new_window.minimize();
+        }
     }
 
     Ok(())

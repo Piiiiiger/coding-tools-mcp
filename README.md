@@ -191,7 +191,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 ## 为什么需要它
 
 - **面向真实开发**：文件、命令、Git、测试和长时间运行的进程都在同一个 Workspace 中。
-- **跨会话持续开发**：新对话可以读取全部历史摘要和最近一次完整交接，不必反复向 AI 解释项目背景和当前进度。
+- **跨会话持续开发**：新对话先获得有界的当前状态，需要精确旧上下文时按关键词定位并读取原始档案，无需反复向 AI 解释项目背景和当前进度。
 - **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
 - **多工作区管理**：一个桌面客户端可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
@@ -205,23 +205,25 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 *复制完整提示词到新会话，即可初始化或恢复历史；每轮任务完成后再保存检查点。*
 
-它提供三个互相配合的历史工具：
+它提供五个互相配合的历史工具：
 
 | 工具 | 作用 |
 | --- | --- |
-| `history_session_bootstrap` | 新对话开始时初始化或恢复项目会话；新文件会固化前序会话的压缩摘要，并返回稳定的 `session_key` 和 `current_path` |
-| `history_session_checkpoint` | 每轮任务完成后按 bootstrap 返回的稳定目标保存结构化进度；目标不一致时拒绝写入，避免串到其他历史文件 |
+| `history_session_bootstrap` | 新对话开始时初始化或恢复项目会话；保存逐字的 `initial_user_input`，返回稳定的 `session_key`、`current_path` 和有界当前状态，不返回全量历史 |
+| `history_session_checkpoint` | 每轮任务完成后按 bootstrap 返回的稳定目标追加结构化进度，并保存逐字的 `raw_user_input`；目标不一致时拒绝写入，避免串到其他历史文件 |
 | `history_session_validate` | 检查历史编号、文件和会话映射；必要时重建派生索引，不删除已有历史 |
+| `history_session_search` | 按确定性关键词搜索长期 Markdown 档案，返回有界的命中位置和短片段 |
+| `history_session_read` | 按编号或搜索结果位置，无损、UTF-8 安全地分页读取一份原始 Markdown 档案；默认每页 `32 KiB`，最多 `64 KiB`，根据 `next_cursor` 继续读取 |
 
 典型效果：
 
 ```text
 对话 1：分析项目 → 修改代码 → 运行测试 → 保存检查点
                                       ↓
-对话 2：读取历史摘要和最新交接 → 从上次进度继续 → 保存新检查点
+对话 2：读取有界当前状态 → 搜索并精读需要的旧档案 → 从上次进度继续 → 保存新检查点
 ```
 
-历史文件使用可读的 Markdown 格式，可以随项目备份或纳入 Git，也方便开发者直接审阅和修订。每个新文件顶部都带有有长度上限的“继承的历史摘要”，旧摘要不会递归复制；检查点采用幂等写入，并要求返回 `ok=true` 且会话目标一致后才确认保存成功。
+历史档案使用可读的 Markdown 格式，可以随项目备份或纳入 Git，也方便开发者直接审阅和修订。`memory/state.json` 是有界当前状态投影，`memory/manifest.json` 只保存位置、哈希与关键词，不复制正文；Markdown 才是长期、无损的事实来源。首次输入和每轮输入必须由 ChatGPT 作为 `initial_user_input`、`raw_user_input` 工具参数传入，服务端无法读取未传入的远程聊天文本。检查点采用幂等追加，同一 `turn_id` 内容变化时保留 revision 与 supersedes 证据，并要求返回 `ok=true` 且会话目标一致后才确认保存成功。
 
 > 历史持久化由 AI 调用 MCP 工具完成，并非桌面端在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
 
@@ -236,7 +238,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | 命令执行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
 | 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
-| 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
+| 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate`、`history_session_search`、`history_session_read` |
 
 典型开发过程：
 

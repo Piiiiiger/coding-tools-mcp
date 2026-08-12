@@ -220,6 +220,80 @@ mod tests {
     }
 
     #[test]
+    fn history_bootstrap_mcp_content_is_concise_instead_of_mirroring_structured_context() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let marker = format!("PRIVATE_PROJECT_STATE_MARKER:{}", "S".repeat(6_000));
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "history_session_bootstrap",
+                    "arguments": {
+                        "session_key": "compact-history",
+                        "initial_user_input": marker
+                    }
+                }
+            }),
+        );
+        let result = &response["result"];
+        let structured = &result["structuredContent"];
+        let model_text = result["content"][0]["text"].as_str().expect("model text");
+
+        assert_eq!(structured["ok"], true);
+        assert!(serde_json::to_string(structured)
+            .expect("serialize structured bootstrap")
+            .contains("PRIVATE_PROJECT_STATE_MARKER"));
+        assert!(!model_text.contains("PRIVATE_PROJECT_STATE_MARKER"));
+        assert!(!model_text.trim_start().starts_with('{'));
+        assert!(model_text.len() < 1_024);
+        assert!(
+            serde_json::to_vec(structured)
+                .expect("serialize structured bootstrap")
+                .len()
+                < 14 * 1024
+        );
+    }
+
+    #[test]
+    fn read_file_mcp_content_remains_human_readable_after_json_mirror_removal() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        fs::write(workspace.path().join("sample.txt"), "plain file body")
+            .expect("write sample file");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_file",
+                    "arguments": {"path": "sample.txt"}
+                }
+            }),
+        );
+        assert_eq!(response["result"]["content"][0]["text"], "plain file body");
+        assert_eq!(
+            response["result"]["structuredContent"]["content"],
+            "plain file body"
+        );
+    }
+
+    #[test]
     fn legacy_grep_calls_are_mapped_to_the_public_grep_text_tool() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");

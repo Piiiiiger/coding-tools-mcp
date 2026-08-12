@@ -483,9 +483,10 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
                 .unwrap_or("application/octet-stream")
         })]
     } else {
+        let text = crate::tools::result_text::render_tool_text(tool_name, &structured, is_error);
         vec![json!({
             "type": "text",
-            "text": structured.to_string()
+            "text": text
         })]
     };
     json!({

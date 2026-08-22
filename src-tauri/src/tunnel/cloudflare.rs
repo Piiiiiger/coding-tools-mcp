@@ -216,9 +216,12 @@ fn quick_tunnel_args(port: u16, config_path: &Path) -> Vec<OsString> {
     ]
 }
 
-/// Apply the global proxy to a tunnel child process environment.
-pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
-    let url = match proxy.mode.as_str() {
+/// Resolve the currently configured global proxy URL.
+///
+/// Keep this shared between cloudflared and frpc so both tunnel backends use
+/// exactly the same manual/system proxy semantics.
+pub(crate) fn resolved_proxy_url(proxy: &ProxyConfig) -> Option<String> {
+    match proxy.mode.as_str() {
         "manual" if !proxy.url.trim().is_empty() => Some(proxy.url.trim().to_string()),
         "system" => std::env::var("HTTPS_PROXY")
             .ok()
@@ -226,7 +229,12 @@ pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
             .or_else(|| std::env::var("HTTP_PROXY").ok().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("ALL_PROXY").ok().filter(|s| !s.is_empty())),
         _ => None,
-    };
+    }
+}
+
+/// Apply the global proxy to a tunnel child process environment.
+pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
+    let url = resolved_proxy_url(proxy);
     if let Some(url) = url {
         for key in [
             "HTTPS_PROXY",

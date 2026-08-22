@@ -15,7 +15,7 @@ use crate::tunnel::TunnelServiceKind;
 use crate::workspace::WorkspaceProfile;
 
 use super::{
-    build_frpc_toml_for_routes, frp_server_config, FrpServerConfig, VERSION as FRP_VERSION,
+    build_frpc_toml_for_route_refs, frp_server_config, FrpServerConfig, VERSION as FRP_VERSION,
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -303,7 +303,7 @@ pub async fn spawn_frpc(
         .first()
         .cloned()
         .ok_or_else(|| AppError::Message("没有可写入的 frpc 日志路径。".into()))?;
-    let config_text = build_frpc_toml_for_routes(&configs);
+    let config_text = build_frpc_toml_for_route_refs(routes, settings);
     std::fs::write(&config_path, &config_text)?;
     let log_offset = log_file_len(&log_path);
 

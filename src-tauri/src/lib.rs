@@ -161,6 +161,26 @@ pub fn run() {
             // Recover FRP clients that stay alive while the public proxy dies
             // (common after install/restart network blips).
             tunnel::ensure_frp_health_loop();
+            if let Ok(raw_ids) = std::env::var("CODING_TOOLS_AUTOSTART_WORKSPACES") {
+                let ids: Vec<String> = raw_ids
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if !ids.is_empty() {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        for id in ids {
+                            let state = handle.state::<AppState>();
+                            if let Err(error) = start_runtime(state, id.clone()).await {
+                                eprintln!("startup runtime auto-start failed for {id}: {error}");
+                            }
+                        }
+                    });
+                }
+            }
             setup_tray(app)?;
             #[cfg(target_os = "windows")]
             {

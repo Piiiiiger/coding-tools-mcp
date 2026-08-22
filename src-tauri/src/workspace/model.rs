@@ -367,6 +367,18 @@ fn computed_public_url(
     settings: &AppSettings,
 ) -> String {
     if tunnel_type == "frp" {
+        // FRP's control-plane server and the public HTTPS endpoint are not
+        // necessarily the same host.  Prefer an explicitly configured public
+        // URL so a client can connect to a raw FRP server address (for example
+        // an IP on :7000) while OAuth metadata continues to advertise the
+        // stable public hostname served at the edge.
+        let configured = public_url.trim().trim_end_matches('/');
+        if !configured.is_empty() {
+            return configured.to_string();
+        }
+
+        // Keep the legacy generated URL as a compatibility fallback for old
+        // profiles that only stored server + subdomain.
         let server = settings
             .find_frp_profile(frp_profile_id)
             .map(|profile| profile.server.as_str())
@@ -376,4 +388,37 @@ fn computed_public_url(
         }
     }
     public_url.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod computed_public_url_tests {
+    use super::*;
+
+    #[test]
+    fn frp_prefers_explicit_public_url() {
+        let url = computed_public_url(
+            "frp",
+            "179.255.146.19",
+            "drone-mcp",
+            "https://drone-mcp.pigger.de5.net/",
+            "",
+            &AppSettings::default(),
+        );
+
+        assert_eq!(url, "https://drone-mcp.pigger.de5.net");
+    }
+
+    #[test]
+    fn frp_keeps_legacy_generated_url_fallback() {
+        let url = computed_public_url(
+            "frp",
+            "179.255.146.19",
+            "drone-mcp",
+            "",
+            "",
+            &AppSettings::default(),
+        );
+
+        assert_eq!(url, "https://drone-mcp.179.255.146.19");
+    }
 }

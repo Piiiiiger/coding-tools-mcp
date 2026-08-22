@@ -66,6 +66,15 @@ pub fn frp_public_url(
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> String {
+    let configured_public_url = match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.public_url.as_str(),
+        TunnelServiceKind::Actions => profile.actions.public_url.as_str(),
+    }
+    .trim();
+    if !configured_public_url.is_empty() {
+        return configured_public_url.trim_end_matches('/').to_string();
+    }
+
     let config = frp_server_config(profile, kind, settings, None);
     if config.server_addr.is_empty() || config.proxy.subdomain.trim().is_empty() {
         return String::new();
@@ -185,6 +194,13 @@ pub fn build_frpc_toml(config: &FrpServerConfig) -> String {
 /// share the same server connection. The supervisor validates that invariant
 /// before calling this function.
 pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String {
+    build_frpc_toml_for_routes_with_proxy(configs, None)
+}
+
+fn build_frpc_toml_for_routes_with_proxy(
+    configs: &[FrpServerConfig],
+    proxy_url: Option<&str>,
+) -> String {
     let Some(first) = configs.first() else {
         return String::new();
     };
@@ -192,8 +208,21 @@ pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String 
     let mut lines = vec![
         format!("serverAddr = \"{}\"", first.server_addr.trim()),
         format!("serverPort = {}", first.server_port),
-        String::new(),
+        // FRP transport TLS stalls behind the current FlClash TUN path on Linux.
+        // The server does not force transport TLS, so keep the control channel
+        // on plain FRP TCP and rely on the FRP token for authentication.
+        "transport.tls.enable = false".to_string(),
     ];
+    if let Some(proxy_url) = proxy_url.filter(|url| !url.trim().is_empty()) {
+        // frpc does not reliably honor HTTP(S)_PROXY for its control channel.
+        // Use FRP's native proxy field so the server connection actually goes
+        // through the configured local HTTP/SOCKS proxy.
+        lines.push(format!(
+            "transport.proxyURL = \"{}\"",
+            proxy_url.trim()
+        ));
+    }
+    lines.push(String::new());
     if let Some(token) = first.token.as_ref().filter(|t| !t.trim().is_empty()) {
         lines.push("auth.method = \"token\"".to_string());
         lines.push(format!("auth.token = \"{}\"", token.trim()));
@@ -227,7 +256,14 @@ pub(crate) fn build_frpc_toml_for_route_refs(
         .iter()
         .map(|(profile, kind)| frp_server_config(profile, *kind, settings, None))
         .collect();
-    build_frpc_toml_for_routes(&configs)
+    let use_proxy = routes.iter().any(|(profile, kind)| match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.use_proxy,
+        TunnelServiceKind::Actions => profile.actions.use_proxy,
+    });
+    let proxy_url = use_proxy
+        .then(|| crate::tunnel::cloudflare::resolved_proxy_url(&settings.proxy))
+        .flatten();
+    build_frpc_toml_for_routes_with_proxy(&configs, proxy_url.as_deref())
 }
 
 fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpProxyConfig {
@@ -274,8 +310,41 @@ fn workspace_proxy_prefix(workspace_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::FrpProfile;
+    use crate::settings::{FrpProfile, ProxyConfig};
     use crate::workspace::WorkspaceProfile;
+
+    #[test]
+    fn frp_public_url_prefers_configured_public_url() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo WS".into()));
+        profile.tunnel.public_url = "https://drone-mcp.pigger.de5.net/".into();
+        profile.tunnel.frp_server = "179.255.146.19".into();
+        profile.tunnel.frp_subdomain = "drone-mcp".into();
+
+        assert_eq!(
+            frp_public_url(
+                &profile,
+                TunnelServiceKind::Mcp,
+                &AppSettings::default(),
+            ),
+            "https://drone-mcp.pigger.de5.net"
+        );
+    }
+
+    #[test]
+    fn frp_public_url_keeps_legacy_generated_fallback() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo WS".into()));
+        profile.tunnel.frp_server = "frp.example.com".into();
+        profile.tunnel.frp_subdomain = "demo".into();
+
+        assert_eq!(
+            frp_public_url(
+                &profile,
+                TunnelServiceKind::Mcp,
+                &AppSettings::default(),
+            ),
+            "https://demo.frp.example.com"
+        );
+    }
 
     #[test]
     fn mcp_snippet_uses_tunnel_subdomain() {
@@ -325,6 +394,38 @@ mod tests {
         let toml = build_frpc_toml(&config);
         assert!(toml.contains("serverAddr = \"frp.example.com\""));
         assert!(toml.contains("auth.token = \"secret\""));
+    }
+
+    #[test]
+    fn route_refs_write_native_frp_proxy_url_when_enabled() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
+        profile.tunnel.frp_server = "179.255.146.19".into();
+        profile.tunnel.frp_server_port = 7000;
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.use_proxy = true;
+
+        let settings = AppSettings {
+            proxy: ProxyConfig {
+                mode: "manual".into(),
+                url: "http://127.0.0.1:7898".into(),
+            },
+            ..AppSettings::default()
+        };
+
+        let proxied = build_frpc_toml_for_route_refs(
+            &[(&profile, TunnelServiceKind::Mcp)],
+            &settings,
+        );
+        assert!(proxied.contains(
+            "transport.proxyURL = \"http://127.0.0.1:7898\""
+        ));
+
+        profile.tunnel.use_proxy = false;
+        let direct = build_frpc_toml_for_route_refs(
+            &[(&profile, TunnelServiceKind::Mcp)],
+            &settings,
+        );
+        assert!(!direct.contains("transport.proxyURL"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod image_tool;
 pub mod patch;
 pub mod policy;
 pub mod registry;
+mod scratch;
 mod result_text;
 pub mod session;
 pub mod workspace;

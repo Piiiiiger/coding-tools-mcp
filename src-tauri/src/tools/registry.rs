@@ -212,7 +212,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "apply_patch",
         "Apply patch",
-        "Apply a patch envelope transactionally inside the workspace.",
+        "Apply persistent project edits transactionally inside the workspace. Do not use workspace-root helper/probe files for one-off diagnostics; prefer exec_command stdin or the scratch_dir reported by check_exec_environment.",
         false,
         true,
         false,
@@ -228,7 +228,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "exec_command",
         "Execute command",
-        "Run a bounded command in the workspace under runtime policy.",
+        "Run a bounded command in the workspace under runtime policy. For one-off Python/JS diagnostics, prefer stdin (for example `python3 -` with the stdin argument) so no helper file is left behind; if a file is required, use scratch_dir from check_exec_environment.",
         false,
         true,
         true,

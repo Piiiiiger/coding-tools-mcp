@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::tools::context::ToolContext;
+use crate::tools::scratch::looks_like_transient_root_helper;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 
 pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -95,6 +96,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let files_created = affected_paths(&affected, "add");
     let files_modified = affected_paths(&affected, "update");
     let files_deleted = affected_paths(&affected, "delete");
+    let warnings = transient_helper_warnings(ctx, &files_created);
 
     if !dry_run {
         let _transaction_backups = commit_staged(ws, &staged)?;
@@ -109,7 +111,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             "files_modified": files_modified,
             "files_deleted": files_deleted,
             "recovery": "git",
-            "warnings": []
+            "warnings": warnings
         })));
     }
 
@@ -122,8 +124,21 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         "would_create": files_created,
         "would_modify": files_modified,
         "would_delete": files_deleted,
-        "warnings": []
+        "warnings": warnings
     })))
+}
+
+fn transient_helper_warnings(ctx: &ToolContext, files_created: &[String]) -> Vec<String> {
+    files_created
+        .iter()
+        .filter(|path| looks_like_transient_root_helper(path))
+        .map(|path| {
+            format!(
+                "{path} looks like a one-off helper/probe in the workspace root. Prefer exec_command stdin, or place temporary files under {} so they are cleaned automatically.",
+                ctx.scratch_dir_display()
+            )
+        })
+        .collect()
 }
 
 pub fn patch_check(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {

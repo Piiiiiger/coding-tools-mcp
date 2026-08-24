@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::harness::Harness;
 use crate::tools::policy::PolicySettings;
+use crate::tools::scratch::ScratchDir;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
 use crate::workspace::AuthConfig;
@@ -14,6 +15,7 @@ pub struct ToolContext {
     pub tool_profile: String,
     pub permission_mode: String,
     pub harness: Harness,
+    scratch: ScratchDir,
     default_cwd: Mutex<PathBuf>,
     pub sessions: Arc<SessionStore>,
 }
@@ -63,6 +65,7 @@ impl ToolContext {
         harness_root: PathBuf,
     ) -> Self {
         let root = workspace.root().to_path_buf();
+        let scratch = ScratchDir::initialize(&root);
         Self {
             workspace,
             auth,
@@ -70,6 +73,7 @@ impl ToolContext {
             tool_profile: crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
+            scratch,
             default_cwd: Mutex::new(root),
             sessions: Arc::new(SessionStore::new()),
         }
@@ -105,5 +109,13 @@ impl ToolContext {
 
     pub fn default_cwd_path(&self) -> PathBuf {
         self.default_cwd.lock().expect("cwd lock").clone()
+    }
+
+    pub fn scratch_dir_display(&self) -> String {
+        relative_display(self.workspace.root(), self.scratch.path())
+    }
+
+    pub fn scratch_dir_available(&self) -> bool {
+        self.scratch.available()
     }
 }

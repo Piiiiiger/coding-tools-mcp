@@ -416,6 +416,9 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "host_scope_available": false
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
+        "scratch_dir": ctx.scratch_dir_display(),
+        "scratch_dir_available": ctx.scratch_dir_available(),
+        "scratch_guidance": "一次性 probe/helper 不要写到 workspace 根目录；优先用 exec_command 的 stdin（例如 python3 -），确需落盘时写入 scratch_dir。scratch session 正常结束自动删除，崩溃残留超过 48 小时会自动清理。",
         "workspace_exec_available": true,
         "workspace_exec_sandbox_enforced": false,
         "workspace_exec_boundary": "policy_only",
